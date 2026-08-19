@@ -92,6 +92,7 @@ class MainActivity : Activity() {
     private val mainHandler by lazy { android.os.Handler(mainLooper) }
 
     private lateinit var statusView: TextView
+    private lateinit var sshStatusView: TextView
     private lateinit var titleView: TextView
     private lateinit var modelButton: TextView
     private lateinit var contextSeat: LinearLayout
@@ -219,6 +220,7 @@ class MainActivity : Activity() {
         pendingOpenSessionId = intent.getStringExtra(TaskMonitorService.EXTRA_OPEN_SESSION_ID)
         configureWindow()
         setContentView(buildScreen())
+        renderSshStatus()
         requestNotificationPermissionIfNeeded()
         configureAuthWebView()
         configureBackNavigation()
@@ -680,6 +682,19 @@ class MainActivity : Activity() {
                     maxLines = 1
                 }
                 addView(statusView, LinearLayout.LayoutParams(WRAP, dp(32)).apply { marginStart = dp(6) })
+                sshStatusView = TextView(this@MainActivity).apply {
+                    text = tr("SSH", "SSH")
+                    textSize = 10f
+                    setTextColor(COLOR_MUTED)
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                    includeFontPadding = false
+                    gravity = Gravity.CENTER_VERTICAL
+                    maxLines = 1
+                    setPadding(dp(7), 0, dp(7), 0)
+                    background = roundedStroke(Color.TRANSPARENT, COLOR_MUTED, 10f)
+                    visibility = View.GONE
+                }
+                addView(sshStatusView, LinearLayout.LayoutParams(WRAP, dp(32)).apply { marginStart = dp(8) })
             }, LinearLayout.LayoutParams(0, dp(44), 1f))
             addView(buildContextSeat(), LinearLayout.LayoutParams(WRAP, dp(34)).apply { marginEnd = dp(2) })
             addView(iconAction(R.drawable.ic_new_session_harness, tr("新建会话", "New session")) { showNewSession() }, LinearLayout.LayoutParams(dp(44), dp(44)))
@@ -2310,10 +2325,28 @@ class MainActivity : Activity() {
                 }
             }
         }
+        renderSshStatus()
+    }
+
+    private fun renderSshStatus() {
+        if (!::sshStatusView.isInitialized) return
+        val ssh = connectMode == CONNECT_MODE_SSH
+        sshStatusView.visibility = if (ssh) View.VISIBLE else View.GONE
+        if (!ssh) return
+        val (label, color) = when (sshTunnelState) {
+            SshTunnelService.STATE_UP -> tr("SSH 隧道已连接", "SSH tunnel up") to COLOR_GREEN
+            SshTunnelService.STATE_DOWN -> tr("SSH 已断开", "SSH down") to COLOR_RED
+            SshTunnelService.STATE_ERR -> tr("SSH 重连中", "SSH reconnecting") to COLOR_AMBER
+            else -> tr("SSH 连接中", "SSH connecting") to COLOR_AMBER
+        }
+        sshStatusView.text = label
+        sshStatusView.setTextColor(color)
+        sshStatusView.background = roundedStroke(Color.TRANSPARENT, color, 10f)
     }
 
     private fun showSshSetup() {
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        // 预填必须与保存/服务读取同一个 prefs 文件，否则每次都要重输主机和用户名
+        val prefs = getSharedPreferences(SshTunnelService.PREFS, MODE_PRIVATE)
         fun sshField(hint: String, value: String, inputType: Int = InputType.TYPE_CLASS_TEXT) =
             EditText(this@MainActivity).apply {
                 this.hint = hint

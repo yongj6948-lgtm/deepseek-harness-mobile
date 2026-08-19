@@ -162,7 +162,7 @@ internal class SshTunnelService : Service() {
             "PreferredAuthentications",
             if (!password.isNullOrEmpty()) "publickey,password,keyboard-interactive" else "publickey",
         )
-        s.serverAliveInterval = 30_000
+        s.serverAliveInterval = 10_000
         s.serverAliveCountMax = 3
         if (!password.isNullOrEmpty()) {
             s.setPassword(password)
