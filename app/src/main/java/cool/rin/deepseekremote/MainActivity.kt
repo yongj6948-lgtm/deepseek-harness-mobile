@@ -2685,6 +2685,10 @@ class MainActivity : Activity() {
     }
 
     private fun selectSession(session: HarnessApi.Session) {
+        // 记录用户真正想切的会话：refresh() 在途请求完成时只能用请求开始时捕获的旧 selectedId
+        // 兜底，若此处不记录，用户在这个过程中点的切换会被回帖无条件 currentSession=selected 覆盖回旧会话
+        // （表现为“切不过去”）。pendingOpenSessionId 优先级最高，选中后会自动清除。
+        pendingOpenSessionId = session.id
         currentSession = session
         currentModels = null
         currentControls = HarnessApi.SessionControls()
