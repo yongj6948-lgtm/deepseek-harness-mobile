@@ -67,6 +67,7 @@ android {
 
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.github.mwiede:jsch:0.2.23")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }

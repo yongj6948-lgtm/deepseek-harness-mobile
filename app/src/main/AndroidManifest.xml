@@ -36,6 +36,10 @@
             android:name=".TaskMonitorService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".SshTunnelService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

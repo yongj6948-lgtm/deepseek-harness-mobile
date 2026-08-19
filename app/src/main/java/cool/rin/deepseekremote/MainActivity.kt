@@ -9,7 +9,10 @@ import android.app.DownloadManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
@@ -76,6 +79,11 @@ class MainActivity : Activity() {
     private var languagePreference = AppLanguagePreference.SYSTEM
     private var appLanguage = AppLanguage.ENGLISH
     private var serverUrl: String? = null
+    private var connectMode = CONNECT_MODE_DIRECT
+    @Volatile private var sshLocalPort = 0
+    @Volatile private var sshTunnelState: String? = null
+    private var sshReceiverRegistered = false
+    private var sshSetupDialog: Dialog? = null
     private val api = HarnessApi(baseUrl = {
         serverUrl ?: throw IOException(tr("尚未配置 Harness 服务器", "Harness server is not configured"))
     })
@@ -192,8 +200,13 @@ class MainActivity : Activity() {
             palette = if (darkTheme) AppPalettes.DARK else AppPalettes.LIGHT
             drawerGroupByWorkspace = prefs.getBoolean(PREF_DRAWER_GROUP_WORKSPACE, true)
             drawerOrderLastUpdated = prefs.getBoolean(PREF_DRAWER_ORDER_UPDATED, true)
-            serverUrl = prefs.getString(PREF_SERVER_URL, null)?.let { saved ->
-                runCatching { ServerConfig.normalize(saved) }.getOrNull()
+            connectMode = prefs.getString(PREF_CONNECT_MODE, CONNECT_MODE_DIRECT) ?: CONNECT_MODE_DIRECT
+            serverUrl = if (connectMode == CONNECT_MODE_SSH) {
+                null // SSH 隧道模式下本地端口会变化，启动时由隧道回调设置
+            } else {
+                prefs.getString(PREF_SERVER_URL, null)?.let { saved ->
+                    runCatching { ServerConfig.normalize(saved) }.getOrNull()
+                }
             }
         }
         debugTodoPreview = BuildConfig.DEBUG && intent.getBooleanExtra(EXTRA_DEBUG_TODO_PREVIEW, false)
@@ -215,6 +228,7 @@ class MainActivity : Activity() {
             debugApprovalPreview -> renderDebugApprovalPreview()
             debugControlsPreview -> renderDebugControlsPreview()
             debugTodoPreview -> renderDebugTodoPreview()
+            connectMode == CONNECT_MODE_SSH -> initializeSshTunnel()
             serverUrl == null -> showServerSetup()
             else -> refresh(showSpinner = true)
         }
@@ -1830,6 +1844,15 @@ class MainActivity : Activity() {
         val connectionListButton = serverDialogAction(tr("连接列表", "Connection list"), COLOR_MUTED)
         val cancelButton = if (required) null else serverDialogAction(tr("取消", "Cancel"), COLOR_MUTED)
         val connectButton = serverDialogAction(tr("测试并连接", "Test and connect"), COLOR_BLUE)
+        val sshLink = TextView(this).apply {
+            text = tr("或通过 SSH 隧道连接（免公网 HTTPS）", "Or connect via SSH tunnel (no public HTTPS port needed)")
+            textSize = 12f
+            setTextColor(COLOR_BLUE)
+            gravity = Gravity.START
+            setPadding(0, dp(2), 0, dp(4))
+            isClickable = true
+            isFocusable = true
+        }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(6), dp(24), dp(10))
@@ -1844,6 +1867,7 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(MATCH, WRAP))
             addView(addressInput, LinearLayout.LayoutParams(MATCH, WRAP))
             addView(errorView, LinearLayout.LayoutParams(MATCH, WRAP))
+            addView(sshLink, LinearLayout.LayoutParams(MATCH, WRAP))
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -1869,6 +1893,10 @@ class MainActivity : Activity() {
         dialog.setCanceledOnTouchOutside(!required)
         dialog.setOnShowListener {
             dialog.window?.setBackgroundDrawable(rounded(COLOR_COMPOSER, 18f))
+            sshLink.setOnClickListener {
+                dialog.dismiss()
+                showSshSetup()
+            }
             connectionListButton.setOnClickListener {
                 dialog.dismiss()
                 showConnectionList(required)
@@ -1893,6 +1921,7 @@ class MainActivity : Activity() {
                     try {
                         candidateApi.sessions()
                         mainHandler.post {
+                            switchToDirectMode()
                             applyServer(candidate)
                             dialog.dismiss()
                             hideAuth()
@@ -1901,6 +1930,7 @@ class MainActivity : Activity() {
                         }
                     } catch (_: HarnessApi.AuthenticationRequired) {
                         mainHandler.post {
+                            switchToDirectMode()
                             applyServer(candidate)
                             dialog.dismiss()
                             showAuth()
@@ -1935,29 +1965,26 @@ class MainActivity : Activity() {
     }
 
     private fun showConnectionList(connectionRequired: Boolean) {
-        val savedConnections = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getStringSet(PREF_SERVER_URLS, emptySet())
-            .orEmpty()
-            .plus(listOfNotNull(serverUrl))
-            .filter { runCatching { ServerConfig.normalize(it) }.isSuccess }
-            .sortedWith(compareByDescending<String> { it == serverUrl }.thenBy { it })
+        val profiles = loadProfiles()
+        val current = currentProfile()
         val builder = AlertDialog.Builder(this)
             .setTitle(tr("连接列表", "Connection list"))
-            .setPositiveButton(tr("添加连接", "Add connection")) { _, _ -> showServerSetup("") }
+            .setPositiveButton(tr("添加连接", "Add connection")) { _, _ -> showAddConnectionMenu() }
             .apply {
-                if (savedConnections.isEmpty()) {
+                if (profiles.isEmpty()) {
                     setMessage(tr("暂无已保存的连接。", "No saved connections yet."))
                 } else {
-                    val labels = savedConnections.map { address ->
-                        if (address == serverUrl) {
-                            tr("$address\n当前连接", "$address\nCurrent connection")
+                    val labels = profiles.map { p ->
+                        val base = profileLabel(p)
+                        if (isSameProfile(p, current)) {
+                            tr("$base\n 当前连接", "$base\n Current connection")
                         } else {
-                            address
+                            base
                         }
                     }
                     setItems(labels.toTypedArray()) { dialog, index ->
                         dialog.dismiss()
-                        showServerSetup(savedConnections[index])
+                        applyProfile(profiles[index])
                     }
                 }
                 if (!connectionRequired) setNegativeButton(tr("取消", "Cancel"), null)
@@ -1973,21 +2000,172 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
-    private fun applyServer(url: String) {
+    private fun showAddConnectionMenu() {
+        val items = arrayOf(
+            tr("直接连接（HTTPS / 内网 HTTP）", "Direct connection (HTTPS / private HTTP)"),
+            tr("SSH 隧道连接", "SSH tunnel connection"),
+        )
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(tr("添加连接", "Add connection"))
+            .setItems(items) { _, which ->
+                if (which == 1) showSshSetup() else showServerSetup("")
+            }
+            .setNegativeButton(tr("取消", "Cancel"), null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.window?.setBackgroundDrawable(rounded(COLOR_COMPOSER, 18f))
+        }
+        dialog.show()
+    }
+
+    private fun applyProfile(p: ConnectionProfile) {
+        when (p.mode) {
+            CONNECT_MODE_SSH -> {
+                stopMuxStream()
+                mainHandler.removeCallbacks(poll)
+                serverUrl = null
+                getSharedPreferences(SshTunnelService.PREFS, MODE_PRIVATE).edit().apply {
+                    putString(SshTunnelService.KEY_SSH_HOST, p.sshHost)
+                    putString(SshTunnelService.KEY_SSH_USER, p.sshUser)
+                    putString(SshTunnelService.KEY_SSH_PORT, p.sshPort.ifBlank { "22" })
+                    putString(SshTunnelService.KEY_REMOTE_PORT, p.sshRemotePort.ifBlank { "3080" })
+                    apply()
+                }
+                connectMode = CONNECT_MODE_SSH
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(PREF_CONNECT_MODE, CONNECT_MODE_SSH).apply()
+                registerSshReceiver()
+                updateStatus(tr("正在建立 SSH 隧道…", "Starting SSH tunnel…"), STATUS_VERIFY)
+                SshTunnelService.start(this, null)
+            }
+            CONNECT_MODE_DIRECT -> {
+                val url = runCatching { ServerConfig.normalize(p.url) }.getOrNull()
+                if (url == null) {
+                    Toast.makeText(this, tr("该连接地址无效", "That connection address is invalid"), Toast.LENGTH_SHORT).show()
+                    return
+                }
+                switchToDirectMode()
+                applyServer(url, persist = true)
+                hideAuth()
+                refresh(showSpinner = true)
+                startMuxStream()
+            }
+        }
+    }
+
+    /* ---- 统一连接列表（直连 + SSH 隧道）的存档 ---- */
+
+    private fun loadProfiles(): MutableList<ConnectionProfile> {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val list = mutableListOf<ConnectionProfile>()
+        val stored = prefs.getString(PREF_PROFILES, null)
+        if (!stored.isNullOrBlank()) {
+            runCatching {
+                val arr = JSONArray(stored)
+                for (i in 0 until arr.length()) {
+                    profileFromJson(arr.optJSONObject(i))?.let { list.add(it) }
+                }
+            }
+        }
+        if (list.isEmpty()) {
+            // 迁移旧版只存直连 URL 的数据
+            prefs.getStringSet(PREF_SERVER_URLS, emptySet()).orEmpty()
+                .filter { runCatching { ServerConfig.normalize(it) }.isSuccess }
+                .forEach { list.add(ConnectionProfile(CONNECT_MODE_DIRECT, url = it)) }
+            saveProfiles(list)
+        }
+        return list
+    }
+
+    private fun saveProfiles(list: List<ConnectionProfile>) {
+        val arr = JSONArray()
+        list.forEach { arr.put(profileToJson(it)) }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(PREF_PROFILES, arr.toString()).apply()
+    }
+
+    private fun upsertDirectProfile(url: String) {
+        val profiles = loadProfiles()
+        profiles.removeAll { it.mode == CONNECT_MODE_DIRECT && it.url == url }
+        profiles.add(0, ConnectionProfile.direct(url))
+        saveProfiles(profiles)
+    }
+
+    private fun upsertSshProfile(p: ConnectionProfile) {
+        val profiles = loadProfiles()
+        profiles.removeAll {
+            it.mode == CONNECT_MODE_SSH &&
+                it.sshHost == p.sshHost && it.sshUser == p.sshUser && it.sshPort == p.sshPort
+        }
+        profiles.add(0, p)
+        saveProfiles(profiles)
+    }
+
+    private fun currentProfile(): ConnectionProfile? =
+        if (connectMode == CONNECT_MODE_SSH) {
+            val sp = getSharedPreferences(SshTunnelService.PREFS, MODE_PRIVATE)
+            ConnectionProfile(
+                CONNECT_MODE_SSH,
+                sshHost = sp.getString(SshTunnelService.KEY_SSH_HOST, "").orEmpty(),
+                sshUser = sp.getString(SshTunnelService.KEY_SSH_USER, "").orEmpty(),
+                sshPort = sp.getString(SshTunnelService.KEY_SSH_PORT, "22").orEmpty(),
+                sshRemotePort = sp.getString(SshTunnelService.KEY_REMOTE_PORT, "3080").orEmpty(),
+            )
+        } else {
+            serverUrl?.let { ConnectionProfile(CONNECT_MODE_DIRECT, url = it) }
+        }
+
+    private fun profileLabel(p: ConnectionProfile): String =
+        if (p.mode == CONNECT_MODE_SSH) {
+            tr("SSH 隧道: ${p.sshUser}@${p.sshHost}:${p.sshPort}", "SSH tunnel: ${p.sshUser}@${p.sshHost}:${p.sshPort}")
+        } else {
+            p.url
+        }
+
+    private fun isSameProfile(a: ConnectionProfile, b: ConnectionProfile?): Boolean {
+        if (b == null || a.mode != b.mode) return false
+        return if (a.mode == CONNECT_MODE_SSH) {
+            a.sshHost == b.sshHost && a.sshUser == b.sshUser
+        } else {
+            a.url == b.url
+        }
+    }
+
+    private fun profileToJson(p: ConnectionProfile): JSONObject = JSONObject().apply {
+        put("mode", p.mode)
+        put("url", p.url)
+        put("sshHost", p.sshHost)
+        put("sshUser", p.sshUser)
+        put("sshPort", p.sshPort)
+        put("sshRemotePort", p.sshRemotePort)
+    }
+
+    private fun profileFromJson(o: JSONObject?): ConnectionProfile? {
+        if (o == null) return null
+        val mode = o.optString("mode")
+        if (mode != CONNECT_MODE_DIRECT && mode != CONNECT_MODE_SSH) return null
+        return ConnectionProfile(
+            mode = mode,
+            url = o.optString("url", ""),
+            sshHost = o.optString("sshHost", ""),
+            sshUser = o.optString("sshUser", ""),
+            sshPort = o.optString("sshPort", "22"),
+            sshRemotePort = o.optString("sshRemotePort", "3080"),
+        )
+    }
+
+    private fun applyServer(url: String, persist: Boolean = true) {
         stopMuxStream()
         mainHandler.removeCallbacks(poll)
         val changed = serverUrl != url
         serverUrl = url
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().apply {
-            putString(PREF_SERVER_URL, url)
-            val savedConnections = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getStringSet(PREF_SERVER_URLS, emptySet())
-                .orEmpty()
-                .toMutableSet()
-            savedConnections.add(url)
-            putStringSet(PREF_SERVER_URLS, savedConnections)
-            if (changed) remove(PREF_DEFAULT_WORKSPACE_ID)
-            apply()
+        if (persist) {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().apply {
+                putString(PREF_SERVER_URL, url)
+                if (changed) remove(PREF_DEFAULT_WORKSPACE_ID)
+                apply()
+            }
+            upsertDirectProfile(url)
         }
         if (changed) {
             providerOnboardingDialog?.dismiss()
@@ -2010,6 +2188,240 @@ class MainActivity : Activity() {
         }
         if (!paused) mainHandler.postDelayed(poll, 1_000)
         requestNotificationPermissionIfNeeded()
+    }
+
+    /* ---- SSH 隧道连接（参考 dsh-mobile-app） ---- */
+
+    private fun switchToDirectMode() {
+        connectMode = CONNECT_MODE_DIRECT
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(PREF_CONNECT_MODE, CONNECT_MODE_DIRECT).apply()
+        sshSetupDialog?.dismiss()
+        sshSetupDialog = null
+        SshTunnelService.stop(this)
+    }
+
+    private fun initializeSshTunnel() {
+        registerSshReceiver()
+        updateStatus(tr("正在建立 SSH 隧道…", "Starting SSH tunnel…"), STATUS_VERIFY)
+        SshTunnelService.start(this, null)
+    }
+
+    private fun registerSshReceiver() {
+        if (sshReceiverRegistered) return
+        sshReceiverRegistered = true
+        registerReceiver(sshTunnelReceiver, IntentFilter(SshTunnelService.ACTION_STATUS))
+    }
+
+    private val sshTunnelReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent == null) return
+            val state = intent.getStringExtra(SshTunnelService.EXTRA_STATE)
+            val msg = intent.getStringExtra(SshTunnelService.EXTRA_MSG)
+            val port = intent.getIntExtra(SshTunnelService.EXTRA_PORT, 0)
+            mainHandler.post { handleSshTunnelState(state, msg, port) }
+        }
+    }
+
+    private fun handleSshTunnelState(state: String?, msg: String?, port: Int) {
+        when (state) {
+            SshTunnelService.STATE_UP -> {
+                sshLocalPort = port
+                sshTunnelState = SshTunnelService.STATE_UP
+                sshSetupDialog?.dismiss()
+                sshSetupDialog = null
+                connectMode = CONNECT_MODE_SSH
+                val localUrl = "http://127.0.0.1:$port"
+                val changed = serverUrl != localUrl
+                applyServer(localUrl, persist = false)
+                hideAuth()
+                if (changed) {
+                    refresh(showSpinner = true)
+                } else {
+                    updateStatus(tr("已连接", "Connected"), STATUS_CONNECTED)
+                }
+                startMuxStream()
+            }
+            SshTunnelService.STATE_CONNECTING -> {
+                updateStatus(tr("SSH 隧道…", "SSH tunnel…"), STATUS_VERIFY)
+            }
+            SshTunnelService.STATE_ERR -> {
+                sshTunnelState = SshTunnelService.STATE_ERR
+                if (serverUrl == null && sshSetupDialog == null) {
+                    val reason = msg?.takeIf { it.isNotBlank() }
+                        ?: tr("无法建立 SSH 隧道", "Could not establish the SSH tunnel")
+                    updateStatus(reason, STATUS_ERROR)
+                    showSshSetup()
+                } else if (serverUrl != null) {
+                    updateStatus(tr("SSH 隧道重连中…", "SSH tunnel reconnecting…"), STATUS_VERIFY)
+                }
+            }
+            SshTunnelService.STATE_DOWN -> {
+                sshTunnelState = SshTunnelService.STATE_DOWN
+                if (serverUrl != null) {
+                    updateStatus(tr("SSH 隧道已断开", "SSH tunnel disconnected"), STATUS_VERIFY)
+                }
+            }
+        }
+    }
+
+    private fun showSshSetup() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        fun sshField(hint: String, value: String, inputType: Int = InputType.TYPE_CLASS_TEXT) =
+            EditText(this@MainActivity).apply {
+                this.hint = hint
+                this.inputType = inputType
+                isSingleLine = true
+                textSize = 15f
+                setTextColor(COLOR_TEXT)
+                setHintTextColor(COLOR_MUTED)
+                background = roundedStroke(COLOR_CONTROL, COLOR_BORDER, 10f)
+                setText(value)
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+            }
+
+        val hostInput = sshField(
+            tr("SSH 主机（电脑 VPN/IP 或域名）", "SSH host (computer VPN/IP or domain)"),
+            prefs.getString(SshTunnelService.KEY_SSH_HOST, "").orEmpty(),
+        )
+        val userInput = sshField(
+            tr("SSH 用户名", "SSH username"),
+            prefs.getString(SshTunnelService.KEY_SSH_USER, "").orEmpty(),
+        )
+        val portInput = sshField(
+            tr("SSH 端口", "SSH port"),
+            prefs.getString(SshTunnelService.KEY_SSH_PORT, "22").orEmpty(),
+            InputType.TYPE_CLASS_NUMBER,
+        )
+        val remoteInput = sshField(
+            tr("远端 DSH 端口（dsh web）", "Remote DSH port (dsh web)"),
+            prefs.getString(SshTunnelService.KEY_REMOTE_PORT, "3080").orEmpty(),
+            InputType.TYPE_CLASS_NUMBER,
+        )
+        val passwordInput = sshField(
+            tr("首次连接密码（可选，用于把公钥装到电脑）", "First-connect password (optional, installs your key on the computer)"),
+            "",
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
+        )
+        val publicKey = try {
+            SshKeys.publicKeyLine(this)
+        } catch (e: Exception) {
+            ""
+        }
+        val errorView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(COLOR_RED)
+            visibility = View.GONE
+            setPadding(0, dp(10), 0, 0)
+        }
+        val copyKeyButton = serverDialogAction(tr("复制本机 SSH 公钥", "Copy my SSH public key"), COLOR_BLUE)
+        val cancelButton = serverDialogAction(tr("取消", "Cancel"), COLOR_MUTED)
+        val connectButton = serverDialogAction(tr("连接并建立隧道", "Connect & tunnel"), COLOR_BLUE)
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(6), dp(24), dp(10))
+            addView(TextView(this@MainActivity).apply {
+                text = tr(
+                    "通过 SSH 把电脑上运行的 DSH（127.0.0.1:3080）转发到手机回环地址，本应用会把它当成本机 Harness。首次连接填一次密码会把本机公钥写入电脑 ~/.ssh/authorized_keys，之后只走公钥。",
+                    "Forward the DSH web running on your computer (127.0.0.1:3080) to the phone's loopback over SSH; the app then treats it as a local Harness. On first connect, enter the password once so your public key is installed to ~/.ssh/authorized_keys; afterwards only the key is used.",
+                )
+                textSize = 13f
+                setTextColor(COLOR_MUTED)
+                setPadding(0, 0, 0, dp(12))
+            }, LinearLayout.LayoutParams(MATCH, WRAP))
+            addView(copyKeyButton, LinearLayout.LayoutParams(WRAP, dp(44)))
+            if (publicKey.isNotBlank()) {
+                addView(TextView(this@MainActivity).apply {
+                    text = publicKey
+                    textSize = 10f
+                    setTextColor(COLOR_MUTED)
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                    setPadding(0, 0, 0, dp(10))
+                }, LinearLayout.LayoutParams(MATCH, WRAP))
+            }
+            addView(hostInput, LinearLayout.LayoutParams(MATCH, WRAP))
+            addView(userInput, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(portInput, LinearLayout.LayoutParams(0, WRAP, 1f))
+                addView(android.widget.Space(this@MainActivity), LinearLayout.LayoutParams(dp(8), 1))
+                addView(remoteInput, LinearLayout.LayoutParams(0, WRAP, 1f))
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+            addView(passwordInput, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) })
+            addView(errorView, LinearLayout.LayoutParams(MATCH, WRAP))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(cancelButton, LinearLayout.LayoutParams(WRAP, dp(48)))
+                addView(android.widget.Space(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                addView(connectButton, LinearLayout.LayoutParams(WRAP, dp(48)))
+            }, LinearLayout.LayoutParams(MATCH, dp(58)).apply { topMargin = dp(10) })
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setCustomTitle(TextView(this).apply {
+                text = tr("SSH 隧道连接", "SSH tunnel connection")
+                textSize = 20f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(COLOR_TEXT)
+                setPadding(dp(24), dp(22), dp(24), dp(8))
+            })
+            .setView(content)
+            .create()
+        sshSetupDialog = dialog
+        dialog.setCancelable(true)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.setOnDismissListener { if (sshSetupDialog === dialog) sshSetupDialog = null }
+        dialog.setOnShowListener {
+            dialog.window?.setBackgroundDrawable(rounded(COLOR_COMPOSER, 18f))
+            copyKeyButton.setOnClickListener {
+                if (publicKey.isNotBlank()) {
+                    val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("SSH public key", publicKey))
+                    Toast.makeText(this, tr("已复制 SSH 公钥", "SSH public key copied"), Toast.LENGTH_SHORT).show()
+                } else {
+                    errorView.text = tr("无法生成 SSH 密钥", "Could not generate the SSH key")
+                    errorView.visibility = View.VISIBLE
+                }
+            }
+            cancelButton.setOnClickListener { dialog.dismiss() }
+            connectButton.setOnClickListener {
+                val host = hostInput.text.toString().trim()
+                val user = userInput.text.toString().trim()
+                if (host.isEmpty() || user.isEmpty()) {
+                    errorView.text = tr("请填写 SSH 主机和用户名", "Please fill in the SSH host and username")
+                    errorView.visibility = View.VISIBLE
+                    return@setOnClickListener
+                }
+                getSharedPreferences(SshTunnelService.PREFS, MODE_PRIVATE).edit().apply {
+                    putString(SshTunnelService.KEY_SSH_HOST, host)
+                    putString(SshTunnelService.KEY_SSH_USER, user)
+                    putString(SshTunnelService.KEY_SSH_PORT, portInput.text.toString().trim().ifEmpty { "22" })
+                    putString(SshTunnelService.KEY_REMOTE_PORT, remoteInput.text.toString().trim().ifEmpty { "3080" })
+                    apply()
+                }
+                upsertSshProfile(
+                    ConnectionProfile(
+                        CONNECT_MODE_SSH,
+                        sshHost = host,
+                        sshUser = user,
+                        sshPort = portInput.text.toString().trim().ifEmpty { "22" },
+                        sshRemotePort = remoteInput.text.toString().trim().ifEmpty { "3080" },
+                    ),
+                )
+                connectMode = CONNECT_MODE_SSH
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(PREF_CONNECT_MODE, CONNECT_MODE_SSH).apply()
+                registerSshReceiver()
+                val password = passwordInput.text.toString().ifEmpty { null }
+                dialog.dismiss()
+                updateStatus(tr("正在建立 SSH 隧道…", "Starting SSH tunnel…"), STATUS_VERIFY)
+                sshSetupDialog = null
+                SshTunnelService.start(this, password)
+            }
+        }
+        dialog.show()
     }
 
     private fun workspaceHeader(title: String, active: Boolean, expanded: Boolean, onToggle: () -> Unit) = LinearLayout(this).apply {
@@ -4395,6 +4807,13 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         refreshGeneration += 1
         mainHandler.removeCallbacksAndMessages(null)
+        if (sshReceiverRegistered) {
+            try {
+                unregisterReceiver(sshTunnelReceiver)
+            } catch (_: IllegalArgumentException) {
+            }
+            sshReceiverRegistered = false
+        }
         worker.shutdownNow()
         streamWorker.shutdownNow()
         authWebView.stopLoading()
@@ -4487,6 +4906,10 @@ class MainActivity : Activity() {
         private const val PREFS_NAME = "deepseek_remote_preferences"
         private const val PREF_SERVER_URL = "server_base_url"
         private const val PREF_SERVER_URLS = "server_base_urls"
+        private const val PREF_PROFILES = "connection_profiles"
+        private const val PREF_CONNECT_MODE = "connect_mode"
+        private const val CONNECT_MODE_DIRECT = "direct"
+        private const val CONNECT_MODE_SSH = "ssh"
         private const val COMMAND_BUTTON_ROTATION_MS = 180L
         private const val PREF_THEME = "appearance_theme"
         private const val PREF_LANGUAGE = "app_language"
