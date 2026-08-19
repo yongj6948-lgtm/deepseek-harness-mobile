@@ -122,3 +122,19 @@
 - HTTP 仅适用于局域网 IP、`localhost` 或 `.local` 地址。
 
 服务器地址与登录 Cookie 只保存在设备本地。本仓库及发布 APK **不包含维护者的服务器域名、账号、密钥或访问凭据**。
+
+## 开发：离线编译验证（无 Android SDK 时）
+
+本机可能没有 Android SDK / JDK 17+，无法直接跑 `gradle assemble`。可用仓库自带脚本做**离线等价编译**（类型/语法/资源引用层面校验，与真实编译基本等价）：
+
+```bash
+# 用 /tmp 下的工具链（kotlinc + android-all(API 36) + 真实 jsch/okhttp/okio）
+tools/verify_compile.sh
+
+# 若工具链换到了别处，用环境变量指定：
+KOTLINC=/path/kotlinc ANDROID_JAR=/path/android-api36.jar tools/verify_compile.sh
+```
+
+脚本会**自动从源码扫描 `R.<type>.<name>` 引用生成 `R.kt`/`BuildConfig.kt` 存根**，编译全部 `app/src/main/java` 并报告 error。
+
+> 注意：这只验证编译通过，**不产 APK**；真正的出包仍由 GitHub Actions（`.github/workflows/android.yml`）在有 Android SDK 的 runner 上完成。改代码前先用该脚本自查，能省去 CI 排队时间。
