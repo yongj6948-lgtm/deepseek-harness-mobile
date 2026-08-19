@@ -4012,16 +4012,19 @@ class MainActivity : Activity() {
         }
 
         if (!drawerGroupByWorkspace) {
-            visibleSessions.forEach { sessionList.addView(sessionRow(it)) }
+            visibleSessions.distinctBy { it.id }.forEach { sessionList.addView(sessionRow(it)) }
             return
         }
 
         val current = currentSession
         val activeWorkspace = WorkspaceBehavior.matchingWorkspace(current, drawerWorkspaces)
-        val placed = mutableSetOf<String>()
+        // 用同一个集合同时兼顾“跨组去重”和“未分组排除”：同一会话只渲染一次，
+        // 避免同一会话命中多个 workspace 时在多个组里重复显示（表现为“多了个名字一样”）。
+        val shown = mutableSetOf<String>()
         drawerWorkspaces.forEach { workspace ->
             val members = visibleSessions.filter { session ->
-                session.id in workspace.sessionIds || WorkspaceBehavior.samePath(session.cwd, workspace.path)
+                session.id !in shown &&
+                    (session.id in workspace.sessionIds || WorkspaceBehavior.samePath(session.cwd, workspace.path))
             }
             if (members.isNotEmpty()) {
                 val active = workspace.id == activeWorkspace?.id
@@ -4034,13 +4037,13 @@ class MainActivity : Activity() {
                     }
                 })
                 if (expanded) {
-                    members.forEach { session -> sessionList.addView(sessionRow(session)) }
+                    members.forEach { session -> if (shown.add(session.id)) sessionList.addView(sessionRow(session)) }
                 }
-                members.forEach { placed += it.id }
+                members.forEach { shown += it.id }
             }
         }
 
-        visibleSessions.filterNot { it.id in placed }
+        visibleSessions.filterNot { it.id in shown }
             .groupBy { it.cwd.orEmpty() }
             .forEach { (path, members) ->
                 val active = activeWorkspace == null && members.any { it.id == current?.id }
@@ -4056,7 +4059,7 @@ class MainActivity : Activity() {
                         renderSessionList()
                     }
                 })
-                if (expanded) members.forEach { session -> sessionList.addView(sessionRow(session)) }
+                if (expanded) members.forEach { session -> if (shown.add(session.id)) sessionList.addView(sessionRow(session)) }
             }
     }
 

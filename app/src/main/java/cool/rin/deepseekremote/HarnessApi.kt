@@ -36,6 +36,7 @@ internal class HarnessApi(
         val updatedAt: Long,
         val running: Boolean,
         val blank: Boolean,
+        val archived: Boolean = false,
     )
 
     data class Workspace(
@@ -173,8 +174,11 @@ internal class HarnessApi(
                 updatedAt = item.optLong("updatedAt"),
                 running = item.optBoolean("running"),
                 blank = item.optBoolean("blank"),
+                // 有的会话已被归档，web 的工作区列表不显示；这里过滤掉，避免 app 显示多一个同名会话。
+                // optBoolean 默认 false，字段不存在时不受影响。
+                archived = item.optBoolean("archived") || values?.optBoolean("archived") == true,
             )
-        }
+        }.filterNot { it.archived }
     }
 
     fun workspaces(): List<Workspace> {
