@@ -50,7 +50,12 @@ internal class SshTunnelService : Service() {
             if (!passwordOrNull.isNullOrEmpty()) {
                 i.putExtra(EXTRA_PASSWORD, passwordOrNull)
             }
-            ctx.startForegroundService(i)
+            // 个别 ROM / FGS 策略会拒绝前台服务启动，降级为普通 startService，避免崩溃
+            try {
+                ctx.startForegroundService(i)
+            } catch (e: Exception) {
+                ctx.startService(i)
+            }
         }
 
         fun stop(ctx: Context) {
@@ -76,11 +81,18 @@ internal class SshTunnelService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        startForeground(1, notification("正在连接 SSH…"))
-        val password = intent?.getStringExtra(EXTRA_PASSWORD)
-        running = true
-        worker?.interrupt()
-        worker = Thread({ connectLoop(password) }, "dsh-ssh").also { it.start() }
+        try {
+            startForeground(1, notification("正在连接 SSH…"))
+            val password = intent?.getStringExtra(EXTRA_PASSWORD)
+            running = true
+            worker?.interrupt()
+            worker = Thread({ connectLoop(password) }, "dsh-ssh").also { it.start() }
+        } catch (e: Exception) {
+            // 前台通知/线程启动被 ROM 拦截时不自杀，广播错误并停服，由主界面提示
+            running = false
+            broadcast(STATE_ERR, e.message ?: e.javaClass.simpleName, 0)
+            stopSelf()
+        }
         return START_STICKY
     }
 

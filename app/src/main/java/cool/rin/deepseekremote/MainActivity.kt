@@ -192,6 +192,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installCrashLogger()
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).let { prefs ->
             languagePreference = AppLanguagePreference.fromStored(prefs.getString(PREF_LANGUAGE, null))
             appLanguage = languagePreference.resolve(systemLanguageTag())
@@ -221,6 +222,7 @@ class MainActivity : Activity() {
         requestNotificationPermissionIfNeeded()
         configureAuthWebView()
         configureBackNavigation()
+        checkCrashLogReport()
         when {
             debugProviderOnboardingPreview -> renderDebugProviderOnboardingPreview()
             debugMessageActionsPreview -> renderDebugMessageActionsPreview()
@@ -231,6 +233,46 @@ class MainActivity : Activity() {
             connectMode == CONNECT_MODE_SSH -> initializeSshTunnel()
             serverUrl == null -> showServerSetup()
             else -> refresh(showSpinner = true)
+        }
+    }
+
+    private fun installCrashLogger() {
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                val sw = java.io.StringWriter()
+                throwable.printStackTrace(java.io.PrintWriter(sw))
+                val stamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+                java.io.File(filesDir, "crash.log").appendText(
+                    "\n===== $stamp [${thread.name}] =====\n" + sw.toString(),
+                )
+            } catch (_: Exception) {
+            }
+            prev?.uncaughtException(thread, throwable)
+        }
+    }
+
+    private fun checkCrashLogReport() {
+        val f = java.io.File(filesDir, "crash.log")
+        if (!f.isFile) return
+        val text = runCatching { f.readText() }.getOrNull()
+        if (text.isNullOrBlank()) return
+        mainHandler.post {
+            runCatching {
+                val dialog = AlertDialog.Builder(this)
+                    .setTitle(tr("上次崩溃日志", "Last crash log"))
+                    .setMessage(text.take(4000))
+                    .setPositiveButton(tr("复制", "Copy")) { _, _ ->
+                        val cb = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                        cb.setPrimaryClip(ClipData.newPlainText("crash", text))
+                        Toast.makeText(this, tr("已复制崩溃日志", "Crash log copied"), Toast.LENGTH_SHORT).show()
+                    }
+                    .setNegativeButton(tr("清除", "Clear")) { _, _ -> f.delete() }
+                    .setNeutralButton(tr("关闭", "Close"), null)
+                    .create()
+                dialog.setOnShowListener { dialog.window?.setBackgroundDrawable(rounded(COLOR_COMPOSER, 18f)) }
+                dialog.show()
+            }
         }
     }
 
