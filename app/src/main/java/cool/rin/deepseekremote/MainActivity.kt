@@ -191,7 +191,8 @@ class MainActivity : Activity() {
     private var liveRefreshScheduled = false
     private val liveRefresh = Runnable {
         liveRefreshScheduled = false
-        refresh(showSpinner = false)
+        // 热路径：只拉当前会话历史并增量渲染，不去拉会话列表（会话列表由 poll 按需刷新）
+        refreshMessages()
     }
     private val runClockTick = object : Runnable {
         override fun run() {
@@ -2258,6 +2259,7 @@ class MainActivity : Activity() {
             pendingApprovalsBySession.clear()
             lastMessages = emptyList()
             lastRenderedSignature = ""
+            resetMessageRows()
         }
         if (!paused) mainHandler.postDelayed(poll, 1_000)
         requestNotificationPermissionIfNeeded()
@@ -2625,6 +2627,63 @@ class MainActivity : Activity() {
         }
     }
 
+
+    /**
+     * liveRefresh 的热路径：只拉当前会话的历史快照并增量渲染，不再重新拉取会话列表
+     * （会话列表由 poll 每 2.5~6s 及前台刷新负责），显著降低任务跑动时的网络与解析开销。
+     * 自带合并闸门，避免并发重入；running 状态由事件流里的 turn/start·turn/end 推导。
+     */
+    private fun refreshMessages() {
+        val session = currentSession ?: return
+        if (messagesRequestRunning) {
+            messagesRefreshQueued = true
+            return
+        }
+        messagesRequestRunning = true
+        val gen = ++renderGeneration
+        val sessionId = session.id
+        worker.execute {
+            try {
+                val history = api.history(sessionId)
+                mainHandler.post {
+                    if (gen != renderGeneration || isFinishing) return@post
+                    messagesRequestRunning = false
+                    val runQueued = messagesRefreshQueued
+                    messagesRefreshQueued = false
+                    if (currentSession?.id != sessionId) {
+                        if (runQueued) mainHandler.post { refreshMessages() }
+                        return@post
+                    }
+                    val newRunning = history.runningStartedAt != null
+                    currentSession = currentSession?.copy(running = newRunning)
+                    currentControls = history.controls
+                    currentStats = history.stats
+                    currentTodos = history.todos
+                    currentContextUsage = history.contextUsage
+                    runningStartedAt = history.runningStartedAt
+                    renderHeader()
+                    renderControls()
+                    renderStats()
+                    renderMessages(history.messages)
+                    maybeHandleCredentialFailure(history.messages)
+                    if (newRunning) mainHandler.post(runClockTick)
+                    if (runQueued) mainHandler.post { refreshMessages() }
+                }
+            } catch (_: HarnessApi.AuthenticationRequired) {
+                mainHandler.post {
+                    if (gen != renderGeneration || isFinishing) return@post
+                    messagesRequestRunning = false
+                    if (!paused) showAuth()
+                }
+            } catch (error: Exception) {
+                mainHandler.post {
+                    if (gen != renderGeneration || isFinishing) return@post
+                    messagesRequestRunning = false
+                }
+            }
+        }
+    }
+
     private fun selectSession(session: HarnessApi.Session) {
         currentSession = session
         currentModels = null
@@ -2633,7 +2692,7 @@ class MainActivity : Activity() {
         currentContextUsage = null
         lastRenderedSignature = ""
         renderHeader()
-        messageContainer.removeAllViews()
+        resetMessageRows()
         emptyView.text = tr("正在载入会话…", "Loading session…")
         emptyView.visibility = View.VISIBLE
         refresh(showSpinner = true)
@@ -2738,6 +2797,9 @@ class MainActivity : Activity() {
         val followBottom = shouldFollowMessageBottom(forceMessageScrollToBottom)
         forceMessageScrollToBottom = false
         lastRenderedSignature = signature
+        // 会话切换守卫：换成另一个会话或断开时整体重建，避免旧会话残留行错位
+        if (messageRowSessionId != currentSession?.id) resetMessageRows()
+        messageRowSessionId = currentSession?.id
         if (animateNextAssistant) {
             messages.lastOrNull {
                 it.role == ChatMessage.Role.ASSISTANT &&
@@ -2748,22 +2810,164 @@ class MainActivity : Activity() {
                 animateNextAssistant = false
             }
         }
+        val running = currentSession?.running == true
+        val changed = reconcileMessageRows(messages, running)
+        if (running) {
+            mainHandler.post(runClockTick)
+        } else {
+            mainHandler.removeCallbacks(runClockTick)
+        }
+        emptyView.visibility = if (messages.isEmpty()) View.VISIBLE else View.GONE
+        emptyView.text = if (currentSession?.blank == true) tr("有什么可以帮忙的？\n\n在远端工作区开始一项任务", "What can I help with?\n\nStart a task in the remote workspace") else tr("还没有可显示的消息", "No messages to show yet")
+        lastMessages = messages
+        if (changed) restoreMessageScrollAfterLayout(followBottom, previousScrollY)
+        if (messages.any { it.assistantFooter != null }) ensureMessageFeedbackLoaded()
+    }
+
+    /** 与内容无关的行结构签名：结构变化（pending→完成、footer 出现、状态翻转等）才重建该行 */
+    private fun messageRowStructure(message: ChatMessage): String {
+        val feedback = message.assistantFooter?.messageId?.let(messageFeedback::get)
+        val pendingFeedback = message.assistantFooter?.messageId?.let(feedbackPending::contains) == true
+        return "${message.role}:${message.activityKind}:${message.state}:${message.pending}:${message.title}:${message.callId}:" +
+            "${message.assistantFooter != null}:${feedback?.rating}:${feedback?.note}:$pendingFeedback"
+    }
+
+    /** 将消息列表以“公共前缀保持 + 尾巴增量增删 + 变更行原地重建”的方式增量渲染到 messageContainer。 */
+    private fun reconcileMessageRows(messages: List<ChatMessage>, running: Boolean): Boolean {
+        var changed = false
+        val desiredKeys = messages.map { it.key }.toMutableList()
+        if (running) desiredKeys += turnStatusKey
+
+        // 公共前缀：key 顺序对齐的行可复用，只做增量更新
+        var prefix = 0
+        while (prefix < messageRowKeys.size && prefix < desiredKeys.size && messageRowKeys[prefix] == desiredKeys[prefix]) prefix++
+
+        // 前缀内按需增量更新
+        for (i in 0 until prefix) {
+            val key = desiredKeys[i]
+            if (key == turnStatusKey) continue // 运行行交给 runClockTick/updateRunClock，不走这里
+            val msg = messages.getOrNull(i) ?: continue
+            val structure = messageRowStructure(msg)
+            if (messageRowStructures[key] != null && messageRowStructures[key] != structure) {
+                replaceMessageRow(i, key, msg)
+                changed = true
+            } else {
+                val hash = msg.text.hashCode()
+                val stored = messageRowTextHashes[key]
+                if (stored != hash) {
+                    val streaming = msg.role == ChatMessage.Role.ASSISTANT &&
+                        (msg.pending || key in locallyAnimatedMessages) &&
+                        streamingAnimations.containsKey(key)
+                    if (streaming && stored != null) {
+                        // 正在流式输出：只续接动画目标文本，不重建、不打断逐字动画
+                        streamingTarget[key] = msg.text
+                    } else if (stored != null && updateBubbleText(key, msg)) {
+                        // 静态文本变化且该行持有可更新的文本视图 → 原地刷新
+                        messageRowTextHashes[key] = hash
+                        changed = true
+                    } else {
+                        replaceMessageRow(i, key, msg)
+                        changed = true
+                    }
+                }
+            }
+        }
+
+        // 截掉超出部分的尾部行
+        while (messageRowKeys.size > desiredKeys.size) { removeTailRow(); changed = true }
+
+        // 中部插入/重排：自首个 key 顺序不匹配处整段重建
+        val maxOk = minOf(messageRowKeys.size, desiredKeys.size)
+        var firstMismatch = -1
+        for (i in prefix until maxOk) {
+            if (messageRowKeys[i] != desiredKeys[i]) { firstMismatch = i; break }
+        }
+        if (firstMismatch >= 0) {
+            while (messageRowKeys.size > firstMismatch) removeTailRow()
+            changed = true
+        }
+
+        // 追加缺失的尾部行
+        for (i in messageRowKeys.size until desiredKeys.size) {
+            appendMessageRow(i, desiredKeys[i], messages.getOrNull(i))
+            changed = true
+        }
+        return changed
+    }
+
+    private fun resetMessageRows() {
         streamingAnimations.values.forEach(mainHandler::removeCallbacks)
         streamingAnimations.clear()
+        streamingRendered.clear()
+        streamingTarget.clear()
+        locallyAnimatedMessages.clear()
         mainHandler.removeCallbacks(runClockTick)
         runClockView = null
         messageContainer.removeAllViews()
-        emptyView.visibility = if (messages.isEmpty()) View.VISIBLE else View.GONE
-        emptyView.text = if (currentSession?.blank == true) tr("有什么可以帮忙的？\n\n在远端工作区开始一项任务", "What can I help with?\n\nStart a task in the remote workspace") else tr("还没有可显示的消息", "No messages to show yet")
-        messages.forEach { messageContainer.addView(messageBubble(it)) }
-        if (currentSession?.running == true) {
-            messageContainer.addView(buildTurnStatus(), LinearLayout.LayoutParams(WRAP, dp(42)))
-            mainHandler.post(runClockTick)
-        }
-        lastMessages = messages
-        restoreMessageScrollAfterLayout(followBottom, previousScrollY)
-        if (messages.any { it.assistantFooter != null }) ensureMessageFeedbackLoaded()
+        messageRowKeys.clear()
+        bubbleTextViews.clear()
+        messageRowStructures.clear()
+        messageRowTextHashes.clear()
+        messageRowSessionId = null
     }
+
+    private fun appendMessageRow(index: Int, key: String, msg: ChatMessage?) {
+        if (key == turnStatusKey) {
+            messageContainer.addView(buildTurnStatus(), index, LinearLayout.LayoutParams(WRAP, dp(42)))
+            messageRowKeys.add(index, key)
+            return
+        }
+        val view = messageBubble(msg!!)
+        messageContainer.addView(view, index, LinearLayout.LayoutParams(MATCH, WRAP))
+        messageRowKeys.add(index, key)
+        messageRowStructures[key] = messageRowStructure(msg)
+        messageRowTextHashes[key] = msg.text.hashCode()
+        messageRowSessionId = currentSession?.id
+    }
+
+    private fun replaceMessageRow(index: Int, key: String, msg: ChatMessage) {
+        streamingAnimations.remove(key)?.let(mainHandler::removeCallbacks)
+        streamingRendered.remove(key)
+        streamingTarget.remove(key)
+        locallyAnimatedMessages.remove(key)
+        messageContainer.removeViewAt(index)
+        bubbleTextViews.remove(key)
+        if (key == turnStatusKey) {
+            runClockView = null
+            messageContainer.addView(buildTurnStatus(), index, LinearLayout.LayoutParams(WRAP, dp(42)))
+            messageRowStructures.remove(key)
+            messageRowTextHashes.remove(key)
+        } else {
+            val view = messageBubble(msg)
+            messageContainer.addView(view, index, LinearLayout.LayoutParams(MATCH, WRAP))
+            messageRowStructures[key] = messageRowStructure(msg)
+            messageRowTextHashes[key] = msg.text.hashCode()
+        }
+    }
+
+    private fun removeTailRow() {
+        val key = messageRowKeys.removeAt(messageRowKeys.size - 1)
+        messageContainer.removeViewAt(messageContainer.childCount - 1)
+        if (key == turnStatusKey) {
+            runClockView = null
+        } else {
+            streamingAnimations.remove(key)?.let(mainHandler::removeCallbacks)
+            streamingRendered.remove(key)
+            streamingTarget.remove(key)
+            locallyAnimatedMessages.remove(key)
+            bubbleTextViews.remove(key)
+            messageRowStructures.remove(key)
+            messageRowTextHashes.remove(key)
+        }
+    }
+
+    /** 原地刷新某条静态消息的文本（无动画）。无法直接更新（如折叠行）时返回 false，由调用方重建整行。 */
+    private fun updateBubbleText(key: String, msg: ChatMessage): Boolean {
+        val bubble = bubbleTextViews[key] ?: return false
+        bubble.text = styledMessage(msg.text)
+        return true
+    }
+
 
     private fun shouldFollowMessageBottom(force: Boolean = false): Boolean {
         val content = messageScroll.getChildAt(0) ?: return true
@@ -2882,6 +3086,8 @@ class MainActivity : Activity() {
                 ChatMessage.Role.REASONING -> null
             }
         }
+        // 记录气泡文本视图，供增量渲染在原地更新静态文本（避免整行重建）
+        bubbleTextViews[message.key] = bubble
         if (shouldAnimate) {
             animateStreamingText(bubble, message)
         }
@@ -3251,23 +3457,33 @@ class MainActivity : Activity() {
     }
 
     private fun animateStreamingText(view: TextView, message: ChatMessage) {
-        val target = message.text
+        // 目标文本放进 streamingTarget：增量快照只更新 target、就地续接动画，不重建、不打断
+        streamingTarget[message.key] = message.text
         val previous = streamingRendered[message.key].orEmpty()
-        var shown = if (target.startsWith(previous)) previous else ""
-        if (shown.isEmpty() && target.codePointCount(0, target.length) > MAX_STREAM_BACKLOG) {
-            val prefixPoints = target.codePointCount(0, target.length) - MAX_STREAM_BACKLOG
-            shown = target.substring(0, target.offsetByCodePoints(0, prefixPoints))
+        val initialTarget = streamingTarget[message.key].orEmpty()
+        var shown = if (initialTarget.startsWith(previous)) previous else ""
+        if (shown.isEmpty() && initialTarget.codePointCount(0, initialTarget.length) > MAX_STREAM_BACKLOG) {
+            val prefixPoints = initialTarget.codePointCount(0, initialTarget.length) - MAX_STREAM_BACKLOG
+            shown = initialTarget.substring(0, initialTarget.offsetByCodePoints(0, prefixPoints))
         }
         view.text = styledMessage(shown)
-        if (shown == target) return
+        // pending 消息即使当前已显示到 target，也要让动画存活，以便增量快照随时续接
+        if (shown == initialTarget && !message.pending) return
 
         val animation = object : Runnable {
             override fun run() {
+                val target = streamingTarget[message.key].orEmpty()
+                if (shown.length > target.length) shown = target
                 if (shown.length >= target.length) {
+                    if (message.pending) {
+                        // 等更多增量，动画保持存活
+                        mainHandler.postDelayed(this, STREAM_FADE_MS)
+                        return
+                    }
                     view.text = styledMessage(target)
                     streamingRendered[message.key] = target
                     streamingAnimations.remove(message.key)
-                    if (!message.pending) locallyAnimatedMessages.remove(message.key)
+                    locallyAnimatedMessages.remove(message.key)
                     return
                 }
                 val next = shown.length + Character.charCount(Character.codePointAt(target, shown.length))
