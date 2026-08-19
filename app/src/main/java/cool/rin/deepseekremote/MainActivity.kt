@@ -160,9 +160,25 @@ class MainActivity : Activity() {
     private val streamingRendered = mutableMapOf<String, String>()
     private val streamingAnimations = mutableMapOf<String, Runnable>()
     private val locallyAnimatedMessages = mutableSetOf<String>()
+    // liveRefresh/poll 每 90ms~6s 会全量重建消息列表，逐条重跑 markdown 正则非常贵。
+    // 缓存最终渲染模板（按 主题+文本），命中时克隆成独立 Spannable 供各 TextView 使用。
+    private val styledCache = object : LinkedHashMap<String, CharSequence>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CharSequence>?): Boolean = size > 256
+    }
     private var knownAssistantKeysBeforePrompt = emptySet<String>()
     private var animateNextAssistant = false
     private var lastMessages = emptyList<ChatMessage>()
+    // —— 消息列表增量渲染状态：以消息 key 为维度的行资源，避免每次快照全量销毁重建 ——
+    private var messageRowSessionId: String? = null
+    private val messageRowKeys = mutableListOf<String>()
+    private val messageRowStructures = mutableMapOf<String, String>()
+    private val messageRowTextHashes = mutableMapOf<String, Int>()
+    private val bubbleTextViews = mutableMapOf<String, TextView>()
+    private val streamingTarget = mutableMapOf<String, String>()
+    private val turnStatusKey = "\u0000turn"
+    private var messagesRequestRunning = false
+    private var messagesRefreshQueued = false
+    private var renderGeneration = 0
     private var forceMessageScrollToBottom = true
     private var pendingMessageScrollRestore: ViewTreeObserver.OnPreDrawListener? = null
     private var providerOnboardingCheckRunning = false
@@ -2845,7 +2861,10 @@ class MainActivity : Activity() {
             textSize = if (message.role == ChatMessage.Role.TOOL) 13f else 16f
             setLineSpacing(dp(3).toFloat(), 1f)
             setTextColor(COLOR_TEXT)
-            setTextIsSelectable(true)
+            // selectable 文本的 measure/layout 成本远高于普通 TextView。assistant 气泡已有
+            // 专属复制按钮，不需要长按选中，去掉以降低每条长消息的渲染与滚动成本；
+            // user 气泡没有复制按钮，保留可选中以维持复制能力。
+            setTextIsSelectable(message.role != ChatMessage.Role.ASSISTANT)
             autoLinkMask = android.text.util.Linkify.WEB_URLS
             movementMethod = LinkMovementMethod.getInstance()
             setPadding(
@@ -3287,6 +3306,8 @@ class MainActivity : Activity() {
     }
 
     private fun styledMessage(source: String): CharSequence {
+        val key = (if (darkTheme) "d:" else "l:") + source
+        styledCache[key]?.let { return SpannableStringBuilder(it) }
         val text = SpannableStringBuilder(source)
         Regex("(?m)^(#{1,6})[ \\t]+(.+)$").findAll(text).toList().asReversed().forEach { match ->
             val markerStart = match.range.first
@@ -3329,6 +3350,7 @@ class MainActivity : Activity() {
             text.setSpan(TypefaceSpan("monospace"), start, styledEnd, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
             text.setSpan(BackgroundColorSpan(COLOR_INLINE_CODE), start, styledEnd, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
+        styledCache[key] = text
         return text
     }
 
