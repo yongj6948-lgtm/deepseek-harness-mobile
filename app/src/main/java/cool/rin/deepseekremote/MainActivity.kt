@@ -2552,6 +2552,9 @@ class MainActivity : Activity() {
     }
 
     private fun refresh(showSpinner: Boolean) {
+        // 重建/外观切换时 onDestroy 会 shutdown worker，已排队的重入回调可能在之后才执行；
+        // 此时再提交会被已终止的线程池拒绝并抛 RejectedExecutionException，直接返回即可。
+        if (isFinishing || worker.isShutdown) return
         if (requestRunning) {
             // 无论后台轮询还是前台显式触发，请求都要排队重放，否则新建/切换会话这类
             // 用户显式动作会在一次进行中的刷新期间被悄悄丢弃（表现为“新建会话切不过去”）。
@@ -2634,6 +2637,9 @@ class MainActivity : Activity() {
      * 自带合并闸门，避免并发重入；running 状态由事件流里的 turn/start·turn/end 推导。
      */
     private fun refreshMessages() {
+        // 同 refresh()：recreate/外观切换时 worker 可能已被 shutdown，重入的
+        // refreshMessages 不能再往终止的线程池提交任务。
+        if (isFinishing || worker.isShutdown) return
         val session = currentSession ?: return
         if (messagesRequestRunning) {
             messagesRefreshQueued = true
