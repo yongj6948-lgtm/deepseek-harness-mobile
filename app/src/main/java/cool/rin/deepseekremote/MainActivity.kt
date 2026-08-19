@@ -124,7 +124,7 @@ class MainActivity : Activity() {
     private var drawerOrderLastUpdated = true
     private val manuallyExpandedWorkspaceKeys = mutableSetOf<String>()
     private var currentSession: HarnessApi.Session? = null
-    private var pendingOpenSessionId: String? = null
+    @Volatile private var pendingOpenSessionId: String? = null
     private var currentModels: HarnessApi.Models? = null
     private var currentControls = HarnessApi.SessionControls()
     private var currentStats = HarnessApi.ConversationStats()
@@ -2502,7 +2502,9 @@ class MainActivity : Activity() {
 
     private fun refresh(showSpinner: Boolean) {
         if (requestRunning) {
-            if (!showSpinner) refreshQueued = true
+            // 无论后台轮询还是前台显式触发，请求都要排队重放，否则新建/切换会话这类
+            // 用户显式动作会在一次进行中的刷新期间被悄悄丢弃（表现为“新建会话切不过去”）。
+            refreshQueued = true
             return
         }
         requestRunning = true
@@ -3909,6 +3911,11 @@ class MainActivity : Activity() {
                 mainHandler.post {
                     drawerWorkspaces = workspaces
                     currentSession = HarnessApi.Session(id, null, session?.cwd, null, System.currentTimeMillis(), false, true)
+                    // 用显式 id 打开新会话而不是依赖 currentSession：refresh() 在携带进行中的
+                    // 请求时会重新按 currentSession 挑选，而那个在途请求的快照仍是旧会话，
+                    // 会把 currentSession 覆盖回去，导致“新建会话切不过去”。pendingOpenSessionId
+                    // 在 refresh 里优先级最高，保证切换到刚创建的会话。
+                    pendingOpenSessionId = id
                     refresh(showSpinner = true)
                 }
             } catch (error: Exception) {
