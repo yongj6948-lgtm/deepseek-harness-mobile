@@ -1,0 +1,69 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'app/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - 'gradle/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 用项目自带 wrapper（gradle 9.4.1），避免与 CI 自带 gradle 版本冲突
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-harness-mobile-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      # secrets 不能出现在 step 的 if: 里，所以把 keystore 是否配置判断放到 run 里，
+      # 通过 step output 透出，再给后续步骤做条件。
+      - name: Prepare release signing
+        id: prep
+        env:
+          KEYSTORE_B64: ${{ secrets.DEEPSEEK_RELEASE_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "release_enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release APK
+        if: ${{ steps.prep.outputs.release_enabled == 'true' }}
+        env:
+          DEEPSEEK_RELEASE_STORE_FILE: ${{ runner.temp }}/release.keystore
+          DEEPSEEK_RELEASE_STORE_PASSWORD: ${{ secrets.DEEPSEEK_RELEASE_STORE_PASSWORD }}
+          DEEPSEEK_RELEASE_KEY_ALIAS: ${{ secrets.DEEPSEEK_RELEASE_KEY_ALIAS }}
+          DEEPSEEK_RELEASE_KEY_PASSWORD: ${{ secrets.DEEPSEEK_RELEASE_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Upload release APK
+        if: ${{ steps.prep.outputs.release_enabled == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-harness-mobile-release
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: warn
