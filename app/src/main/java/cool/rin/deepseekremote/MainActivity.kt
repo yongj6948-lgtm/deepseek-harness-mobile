@@ -2252,7 +2252,12 @@ class MainActivity : Activity() {
     private fun registerSshReceiver() {
         if (sshReceiverRegistered) return
         sshReceiverRegistered = true
-        registerReceiver(sshTunnelReceiver, IntentFilter(SshTunnelService.ACTION_STATUS))
+        if (Build.VERSION.SDK_INT >= 33) {
+            // Android 13+ 动态注册广播必须显式指定导出标志，否则抛 SecurityException
+            registerReceiver(sshTunnelReceiver, IntentFilter(SshTunnelService.ACTION_STATUS), Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(sshTunnelReceiver, IntentFilter(SshTunnelService.ACTION_STATUS))
+        }
     }
 
     private val sshTunnelReceiver = object : BroadcastReceiver() {
