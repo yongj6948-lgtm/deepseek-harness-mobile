@@ -82,7 +82,7 @@ import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
     private var themePreference = AppThemePreference.DARK
-    private var darkTheme = true
+    @Volatile private var darkTheme = true
     private lateinit var palette: AppPalette
     private var languagePreference = AppLanguagePreference.SYSTEM
     private var appLanguage = AppLanguage.ENGLISH
@@ -195,7 +195,8 @@ class MainActivity : Activity() {
     // A 打点：markdown 计算规模（跨线程累计，预热/渲染前后读数做差）
     private val mdPerfMisses = AtomicLong()
     private val mdPerfMillis = AtomicLong()
-    private val PERF_LOG = true
+    // 打点只在 debug 包输出，避免正式包每次刷新都刷 logcat
+    private val PERF_LOG = BuildConfig.DEBUG
     private var knownAssistantKeysBeforePrompt = emptySet<String>()
     private var animateNextAssistant = false
     private var lastMessages = emptyList<ChatMessage>()
