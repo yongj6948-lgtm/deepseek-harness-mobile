@@ -15,6 +15,7 @@ import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import java.io.IOException
 import java.util.concurrent.Executors
 
 class TaskMonitorService : Service() {
@@ -30,6 +31,8 @@ class TaskMonitorService : Service() {
     @Volatile private var polling = false
     @Volatile private var serverUrl: String? = null
     private var foregroundId = PLACEHOLDER_NOTIFICATION_ID
+    // 复用同一个 HarnessApi（内部共享连接池/线程池），避免每 3s poll 建新实例泄漏资源。
+    private var monitorApi: HarnessApi? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -99,7 +102,9 @@ class TaskMonitorService : Service() {
 
     private fun pollOnce() {
         val root = serverUrl ?: return
-        val api = HarnessApi(baseUrl = { root })
+        val api = monitorApi ?: HarnessApi(baseUrl = {
+            serverUrl ?: throw IOException("Harness server is not configured")
+        }).also { monitorApi = it }
         val sessions = api.sessions()
         val running = sessions.filter { it.running }.associateBy { it.id }
         val completed = mutableListOf<Pair<String, WatchedSession>>()

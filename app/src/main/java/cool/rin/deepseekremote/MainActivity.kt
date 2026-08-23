@@ -2363,6 +2363,8 @@ class MainActivity : Activity() {
             SshTunnelService.STATE_UP -> {
                 sshLocalPort = port
                 sshTunnelState = SshTunnelService.STATE_UP
+                // 隧道是新建立的，旧隧道上的复用连接全部作废，立即清空避免复用到半死连接。
+                api.evictConnections()
                 sshSetupDialog?.dismiss()
                 sshSetupDialog = null
                 connectMode = CONNECT_MODE_SSH
@@ -2393,6 +2395,7 @@ class MainActivity : Activity() {
             }
             SshTunnelService.STATE_DOWN -> {
                 sshTunnelState = SshTunnelService.STATE_DOWN
+                api.evictConnections()
                 if (serverUrl != null) {
                     updateStatus(tr("SSH 隧道已断开", "SSH tunnel disconnected"), STATUS_VERIFY)
                 }

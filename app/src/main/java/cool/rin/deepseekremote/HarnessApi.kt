@@ -18,10 +18,29 @@ import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * 所有 HarnessApi 实例共享的 RPC 长连接与并发池（随 app 进程常驻、懒加载）。
+ * 不能在实例里建线程池/连接池：TaskMonitorService 每 3s 会 new 一个 HarnessApi，
+ * 实例级池子会疯狂泄漏线程与连接，直接拖垮整机。
+ */
+private val sharedRpcClient: OkHttpClient by lazy {
+    OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        // keepAlive 仅 3s：只复用请求突发内的连接；闲置即回收，避免池里攒一堆
+        // 被服务器侧悄悄关掉的半死连接（复用半死连接 = 每次 RPC 白等一个读超时）。
+        .connectionPool(okhttp3.ConnectionPool(1, 3, TimeUnit.SECONDS))
+        .build()
+}
+
+private val sharedOnboardingPool: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
 
 internal class HarnessApi(
     private val baseUrl: () -> String,
@@ -33,20 +52,6 @@ internal class HarnessApi(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
-
-    /**
-     * RPC 专用：带连接池的持久连接。ssh 隧道场景下所有请求复用同一条 TCP+SSH channel
-     * （每次少一次 channel 握手 + 慢启动），只读请求另有应用层快速重试兜底。
-     */
-    private val rpcClient = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .writeTimeout(10, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .connectionPool(okhttp3.ConnectionPool(2, 30, TimeUnit.SECONDS))
-        .build()
-
-    /** providerOnboarding 里并发拉 llm.providers 与 settings.describe 用（随 app 常驻，无需关闭）。 */
-    private val onboardingPool = Executors.newFixedThreadPool(2)
 
     companion object {
         /** 幂等/只读方法：丢包或瞬时故障时可安全重试。写操作一律只发一次，避免重复提交。 */
@@ -63,7 +68,7 @@ internal class HarnessApi(
             "messageFeedback/list",
         )
         private const val MAX_ATTEMPTS = 3
-        private const val READ_ONLY_TIMEOUT_MS = 6_000L
+        private const val READ_ONLY_TIMEOUT_MS = 4_000L
         private const val WRITE_TIMEOUT_MS = 15_000L
         private const val RETRY_DELAY_MS = 300L
     }
@@ -385,8 +390,8 @@ internal class HarnessApi(
 
     fun providerOnboarding(): ProviderOnboarding {
         // llm.providers 与 settings.describe 相互独立：并发拉取，省一次串行往返。
-        val providersFuture = onboardingPool.submit<JSONObject> { call("llm.providers", JSONObject()) }
-        val settingsFuture = onboardingPool.submit<JSONObject> { call("settings.describe", JSONObject()) }
+        val providersFuture = sharedOnboardingPool.submit<JSONObject> { call("llm.providers", JSONObject()) }
+        val settingsFuture = sharedOnboardingPool.submit<JSONObject> { call("settings.describe", JSONObject()) }
         val providers = await(providersFuture)
         val settings = try {
             await(settingsFuture)
@@ -689,7 +694,7 @@ internal class HarnessApi(
             readOnly -> READ_ONLY_TIMEOUT_MS
             else -> WRITE_TIMEOUT_MS
         }
-        val client = rpcClient.newBuilder()
+        val client = sharedRpcClient.newBuilder()
             .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
             .build()
         val request = Request.Builder()
@@ -752,6 +757,14 @@ internal class HarnessApi(
         future.get()
     } catch (e: ExecutionException) {
         throw e.cause ?: e
+    }
+
+    /**
+     * SSH 隧道断开/重连后调用：立即丢弃全部复用连接，避免继续在旧隧道
+     * （或已被服务器侧关闭的半死连接）上发请求。
+     */
+    fun evictConnections() {
+        sharedRpcClient.connectionPool.evictAll()
     }
 }
 
