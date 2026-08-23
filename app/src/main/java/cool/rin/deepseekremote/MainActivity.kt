@@ -76,7 +76,9 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
@@ -86,7 +88,7 @@ class MainActivity : Activity() {
     private lateinit var palette: AppPalette
     private var languagePreference = AppLanguagePreference.SYSTEM
     private var appLanguage = AppLanguage.ENGLISH
-    private var serverUrl: String? = null
+    @Volatile private var serverUrl: String? = null
     private var connectMode = CONNECT_MODE_DIRECT
     @Volatile private var sshLocalPort = 0
     @Volatile private var sshTunnelState: String? = null
@@ -97,6 +99,9 @@ class MainActivity : Activity() {
     })
     private val worker = Executors.newSingleThreadExecutor()
     private val streamWorker = Executors.newSingleThreadExecutor()
+    // refresh() 在 session.list 之后再并行拉 history/models（onboarding 内部也并发），
+    // worker 等待 Future.get 期间短暂占用这两个线程，把串行 RPC 链压短。
+    private val netPool = Executors.newFixedThreadPool(2)
     private val mainHandler by lazy { android.os.Handler(mainLooper) }
 
     private lateinit var statusView: TextView
@@ -2601,6 +2606,13 @@ class MainActivity : Activity() {
         layoutParams = LinearLayout.LayoutParams(MATCH, dp(34))
     }
 
+    /** 解包 Future.get 的 ExecutionException，把真实 RPC 异常原样抛给 refresh 的 catch。 */
+    private fun <T> netGet(future: Future<T>): T = try {
+        future.get()
+    } catch (e: ExecutionException) {
+        throw e.cause ?: e
+    }
+
     private fun refresh(showSpinner: Boolean) {
         // 重建/外观切换时 onDestroy 会 shutdown worker，已排队的重入回调可能在之后才执行；
         // 此时再提交会被已终止的线程池拒绝并抛 RejectedExecutionException，直接返回即可。
@@ -2624,8 +2636,9 @@ class MainActivity : Activity() {
                     ?: newSessions.firstOrNull { it.id == selectedId }
                     ?: newSessions.firstOrNull { !it.blank }
                     ?: newSessions.firstOrNull()
-                val history = selected?.let { api.history(it.id) }
-                val models = selected?.let { api.models(it.id) }
+                // history/models 相互独立，并行拉取（各自内部还有只读快速重试兜底）。
+                val history = selected?.let { s -> netGet(netPool.submit<HarnessApi.History> { api.history(s.id) }) }
+                val models = selected?.let { s -> netGet(netPool.submit<HarnessApi.Models> { api.models(s.id) }) }
                 perfLog("load.network", SystemClock.elapsedRealtime() - fetchStart)
                 val warmStart = SystemClock.elapsedRealtime(); val warmMiss0 = mdPerfMisses.get(); val warmMs0 = mdPerfMillis.get()
                 warmStyledCache(history?.messages.orEmpty())
@@ -5515,6 +5528,7 @@ class MainActivity : Activity() {
         }
         worker.shutdownNow()
         streamWorker.shutdownNow()
+        netPool.shutdownNow()
         authWebView.stopLoading()
         authWebView.destroy()
         super.onDestroy()

@@ -2,8 +2,10 @@ package cool.rin.deepseekremote
 
 import android.webkit.CookieManager
 import android.util.Log
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -15,6 +17,9 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -28,6 +33,40 @@ internal class HarnessApi(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
+
+    /**
+     * RPC 专用：带连接池的持久连接。ssh 隧道场景下所有请求复用同一条 TCP+SSH channel
+     * （每次少一次 channel 握手 + 慢启动），只读请求另有应用层快速重试兜底。
+     */
+    private val rpcClient = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .connectionPool(okhttp3.ConnectionPool(2, 30, TimeUnit.SECONDS))
+        .build()
+
+    /** providerOnboarding 里并发拉 llm.providers 与 settings.describe 用（随 app 常驻，无需关闭）。 */
+    private val onboardingPool = Executors.newFixedThreadPool(2)
+
+    companion object {
+        /** 幂等/只读方法：丢包或瞬时故障时可安全重试。写操作一律只发一次，避免重复提交。 */
+        private val READ_ONLY_METHODS = setOf(
+            "session.list",
+            "session.history",
+            "session.models",
+            "workspace.list",
+            "host.listDirectory",
+            "llm.providers",
+            "settings.describe",
+            "credentials.describe",
+            "agentPreset.list",
+            "messageFeedback/list",
+        )
+        private const val MAX_ATTEMPTS = 3
+        private const val READ_ONLY_TIMEOUT_MS = 6_000L
+        private const val WRITE_TIMEOUT_MS = 15_000L
+        private const val RETRY_DELAY_MS = 300L
+    }
     data class Session(
         val id: String,
         val title: String?,
@@ -345,9 +384,12 @@ internal class HarnessApi(
     }
 
     fun providerOnboarding(): ProviderOnboarding {
-        val providers = call("llm.providers", JSONObject())
+        // llm.providers 与 settings.describe 相互独立：并发拉取，省一次串行往返。
+        val providersFuture = onboardingPool.submit<JSONObject> { call("llm.providers", JSONObject()) }
+        val settingsFuture = onboardingPool.submit<JSONObject> { call("settings.describe", JSONObject()) }
+        val providers = await(providersFuture)
         val settings = try {
-            call("settings.describe", JSONObject())
+            await(settingsFuture)
         } catch (_: SettingsAccessForbidden) {
             return ProviderOnboarding.Unavailable("当前连接无权读取 Harness 设置")
         }
@@ -638,44 +680,78 @@ internal class HarnessApi(
             put("payload", payload)
         }
         val root = baseUrl()
-        val connection = (URL("$root/api/$method")
-            .openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            instanceFollowRedirects = false
-            connectTimeout = 15_000
-            readTimeout = if (method == "session.prompt") 45_000 else 25_000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("User-Agent", "DeepSeekHarnessMobile/${BuildConfig.VERSION_NAME}")
-            cookieHeader(root)?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Cookie", it) }
+        val readOnly = method in READ_ONLY_METHODS
+        // 只读请求在丢包/瞬时故障时用更短超时 + 快速重试；写请求只发一次
+        // （OkHttp 自身也只在连接刚建立且尚未写出请求体时才重试，不会重复提交）。
+        val maxAttempts = if (readOnly) MAX_ATTEMPTS else 1
+        val readTimeoutMs = when {
+            method == "session.prompt" -> 45_000L
+            readOnly -> READ_ONLY_TIMEOUT_MS
+            else -> WRITE_TIMEOUT_MS
         }
-        try {
-            connection.outputStream.use { it.write(envelope.toString().toByteArray(Charsets.UTF_8)) }
-            val status = connection.responseCode
-            when (classifyHarnessHttpFailure(method, status)) {
-                HarnessHttpFailure.AUTHENTICATION -> throw AuthenticationRequired()
-                HarnessHttpFailure.SETTINGS_ACCESS_FORBIDDEN -> throw SettingsAccessForbidden()
-                HarnessHttpFailure.HTTP, null -> Unit
+        val client = rpcClient.newBuilder()
+            .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+            .build()
+        val request = Request.Builder()
+            .url("$root/api/$method")
+            .post(envelope.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .header("Accept", "application/json")
+            .header("User-Agent", "DeepSeekHarnessMobile/${BuildConfig.VERSION_NAME}")
+            .apply { cookieHeader(root)?.takeIf { it.isNotBlank() }?.let { header("Cookie", it) } }
+            .build()
+        var lastFailure: IOException? = null
+        for (attempt in 0 until maxAttempts) {
+            if (attempt > 0) {
+                try {
+                    Thread.sleep(RETRY_DELAY_MS * attempt)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw IOException("Harness request interrupted", e)
+                }
             }
-            val contentType = connection.contentType.orEmpty().lowercase()
-            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (status !in 200..299) throw IOException("Harness HTTP $status")
-            if (!contentType.contains("application/json") || text.trimStart().startsWith("<")) {
-                throw AuthenticationRequired()
+            try {
+                client.newCall(request).execute().use { response ->
+                    val status = response.code
+                    when (classifyHarnessHttpFailure(method, status)) {
+                        HarnessHttpFailure.AUTHENTICATION -> throw AuthenticationRequired()
+                        HarnessHttpFailure.SETTINGS_ACCESS_FORBIDDEN -> throw SettingsAccessForbidden()
+                        HarnessHttpFailure.HTTP, null -> Unit
+                    }
+                    val contentType = response.header("Content-Type").orEmpty().lowercase()
+                    val text = response.body?.string().orEmpty()
+                    if (status !in 200..299) throw IOException("Harness HTTP $status")
+                    if (!contentType.contains("application/json") || text.trimStart().startsWith("<")) {
+                        throw AuthenticationRequired()
+                    }
+                    val parsed = JSONObject(text)
+                    if (parsed.optString("rpcId") != rpcId) throw IOException("Harness response correlation failed")
+                    val result = parsed.getJSONObject("result")
+                    if (!result.getBoolean("ok")) {
+                        val error = result.getJSONObject("error")
+                        throw RemoteFailure(error.optString("code", "remote-error"), error.optString("message", "Harness request failed"))
+                    }
+                    return result.optJSONObject("value") ?: JSONObject()
+                }
+            } catch (failure: IOException) {
+                // 业务异常（鉴权/远程拒绝）直接抛；只有网络层/瞬时故障才走重试。
+                if (failure is AuthenticationRequired ||
+                    failure is SettingsAccessForbidden ||
+                    failure is RemoteFailure
+                ) {
+                    throw failure
+                }
+                lastFailure = failure
+                if (!readOnly || attempt == maxAttempts - 1) throw failure
             }
-            val response = JSONObject(text)
-            if (response.optString("rpcId") != rpcId) throw IOException("Harness response correlation failed")
-            val result = response.getJSONObject("result")
-            if (!result.getBoolean("ok")) {
-                val error = result.getJSONObject("error")
-                throw RemoteFailure(error.optString("code", "remote-error"), error.optString("message", "Harness request failed"))
-            }
-            return result.optJSONObject("value") ?: JSONObject()
-        } finally {
-            connection.disconnect()
         }
+        throw lastFailure ?: IOException("Harness request failed")
+    }
+
+    /** 解包 Future.get 的 ExecutionException，把真实异常原样抛给调用方。 */
+    private fun <T> await(future: Future<T>): T = try {
+        future.get()
+    } catch (e: ExecutionException) {
+        throw e.cause ?: e
     }
 }
 
