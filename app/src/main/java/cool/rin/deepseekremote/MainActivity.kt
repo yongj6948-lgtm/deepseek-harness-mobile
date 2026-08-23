@@ -38,6 +38,7 @@ import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
 import android.util.Base64
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.provider.MediaStore
@@ -76,6 +77,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
@@ -185,9 +187,15 @@ class MainActivity : Activity() {
     private val locallyAnimatedMessages = mutableSetOf<String>()
     // liveRefresh/poll 每 90ms~6s 会全量重建消息列表，逐条重跑 markdown 正则非常贵。
     // 缓存最终渲染模板（按 主题+文本），命中时克隆成独立 Spannable 供各 TextView 使用。
+    // 主线程渲染前由 worker 线程 warmStyledCache() 预热，因此缓存跨线程读写，需锁保护。
     private val styledCache = object : LinkedHashMap<String, CharSequence>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CharSequence>?): Boolean = size > 256
     }
+    private val styledCacheLock = Any()
+    // A 打点：markdown 计算规模（跨线程累计，预热/渲染前后读数做差）
+    private val mdPerfMisses = AtomicLong()
+    private val mdPerfMillis = AtomicLong()
+    private val PERF_LOG = true
     private var knownAssistantKeysBeforePrompt = emptySet<String>()
     private var animateNextAssistant = false
     private var lastMessages = emptyList<ChatMessage>()
@@ -2608,6 +2616,7 @@ class MainActivity : Activity() {
         val selectedId = currentSession?.id
         worker.execute {
             try {
+                val fetchStart = SystemClock.elapsedRealtime()
                 val newSessions = api.sessions()
                 val requestedId = pendingOpenSessionId
                 val selected = newSessions.firstOrNull { it.id == requestedId }
@@ -2616,6 +2625,10 @@ class MainActivity : Activity() {
                     ?: newSessions.firstOrNull()
                 val history = selected?.let { api.history(it.id) }
                 val models = selected?.let { api.models(it.id) }
+                perfLog("load.network", SystemClock.elapsedRealtime() - fetchStart)
+                val warmStart = SystemClock.elapsedRealtime(); val warmMiss0 = mdPerfMisses.get(); val warmMs0 = mdPerfMillis.get()
+                warmStyledCache(history?.messages.orEmpty())
+                perfLog("load.mdWarm", SystemClock.elapsedRealtime() - warmStart, mdPerfMisses.get() - warmMiss0, mdPerfMillis.get() - warmMs0)
                 mainHandler.post {
                     if (generation != refreshGeneration || isFinishing) return@post
                     requestRunning = false
@@ -2691,7 +2704,10 @@ class MainActivity : Activity() {
         val sessionId = session.id
         worker.execute {
             try {
+                val fetchStart = SystemClock.elapsedRealtime()
                 val history = api.history(sessionId)
+                perfLog("live.network", SystemClock.elapsedRealtime() - fetchStart)
+                warmStyledCache(history.messages)
                 mainHandler.post {
                     if (gen != renderGeneration || isFinishing) return@post
                     messagesRequestRunning = false
@@ -2844,12 +2860,19 @@ class MainActivity : Activity() {
             "${it.key}:${it.text.hashCode()}:${it.detail?.hashCode()}:${it.pending}:${it.state}:${it.assistantFooter}:${feedback?.rating}:${feedback?.note}:${it.assistantFooter?.messageId?.let(feedbackPending::contains) == true}"
         }
         if (signature == lastRenderedSignature) return
+        val renderStart = SystemClock.elapsedRealtime()
+        val renderMiss0 = mdPerfMisses.get(); val renderMs0 = mdPerfMillis.get()
+        var resetMs = 0L
         val previousScrollY = messageScroll.scrollY
         val followBottom = shouldFollowMessageBottom(forceMessageScrollToBottom)
         forceMessageScrollToBottom = false
         lastRenderedSignature = signature
         // 会话切换守卫：换成另一个会话或断开时整体重建，避免旧会话残留行错位
-        if (messageRowSessionId != currentSession?.id) resetMessageRows()
+        if (messageRowSessionId != currentSession?.id) {
+            val resetStart = SystemClock.elapsedRealtime()
+            resetMessageRows()
+            resetMs = SystemClock.elapsedRealtime() - resetStart
+        }
         messageRowSessionId = currentSession?.id
         if (animateNextAssistant) {
             messages.lastOrNull {
@@ -2873,6 +2896,8 @@ class MainActivity : Activity() {
         lastMessages = messages
         if (changed) restoreMessageScrollAfterLayout(followBottom, previousScrollY)
         if (messages.any { it.assistantFooter != null }) ensureMessageFeedbackLoaded()
+        perfLog("render.total", SystemClock.elapsedRealtime() - renderStart, mdPerfMisses.get() - renderMiss0, mdPerfMillis.get() - renderMs0)
+        if (resetMs > 0) perfLog("render.reset", resetMs)
     }
 
     /** 与内容无关的行结构签名：结构变化（pending→完成、footer 出现、状态翻转等）才重建该行 */
@@ -3116,10 +3141,12 @@ class MainActivity : Activity() {
             textSize = if (message.role == ChatMessage.Role.TOOL) 13f else 16f
             setLineSpacing(dp(3).toFloat(), 1f)
             setTextColor(COLOR_TEXT)
-            // selectable 文本的 measure/layout 成本远高于普通 TextView。assistant 气泡已有
-            // 专属复制按钮，不需要长按选中，去掉以降低每条长消息的渲染与滚动成本；
-            // user 气泡没有复制按钮，保留可选中以维持复制能力。
-            setTextIsSelectable(message.role != ChatMessage.Role.ASSISTANT)
+            // 长按划选：user 气泡始终可选中；assistant 回复在"流式生成/逐字动画"期间保持
+            // 不可选中（selectable 文本的 measure/layout 成本更高，避免拖慢逐字渲染），
+            // 生成完成后由 animateStreamingText 就地启用划选（原有"复制全文"按钮保留）。
+            val streamingAssistant = message.role == ChatMessage.Role.ASSISTANT &&
+                (message.pending || message.key in locallyAnimatedMessages)
+            setTextIsSelectable(message.role != ChatMessage.Role.ASSISTANT || !streamingAssistant)
             autoLinkMask = android.text.util.Linkify.WEB_URLS
             movementMethod = LinkMovementMethod.getInstance()
             setPadding(
@@ -3519,7 +3546,10 @@ class MainActivity : Activity() {
         }
         view.text = styledMessage(shown)
         // pending 消息即使当前已显示到 target，也要让动画存活，以便增量快照随时续接
-        if (shown == initialTarget && !message.pending) return
+        if (shown == initialTarget && !message.pending) {
+            enableReplySelection(view) // 静态已完整显示：直接进入可划选
+            return
+        }
 
         val animation = object : Runnable {
             override fun run() {
@@ -3532,6 +3562,7 @@ class MainActivity : Activity() {
                         return
                     }
                     view.text = styledMessage(target)
+                    enableReplySelection(view) // 生成完成：启用长按划选
                     streamingRendered[message.key] = target
                     streamingAnimations.remove(message.key)
                     locallyAnimatedMessages.remove(message.key)
@@ -3549,6 +3580,13 @@ class MainActivity : Activity() {
         }
         streamingAnimations[message.key] = animation
         mainHandler.post(animation)
+    }
+
+    /** 生成完成后允许长按划选 assistant 回复。setTextIsSelectable 会把 movement method
+     *  重置为 ArrowKey，需重挂 LinkMovementMethod 以保留链接点击（与方法体创建时的顺序一致）。 */
+    private fun enableReplySelection(view: TextView) {
+        view.setTextIsSelectable(true)
+        view.movementMethod = LinkMovementMethod.getInstance()
     }
 
     private fun styledStreamingMessage(source: String): CharSequence {
@@ -3574,7 +3612,11 @@ class MainActivity : Activity() {
 
     private fun styledMessage(source: String): CharSequence {
         val key = (if (darkTheme) "d:" else "l:") + source
-        styledCache[key]?.let { return SpannableStringBuilder(it) }
+        // 缓存被 worker（预热）与主线程（渲染）并发读写，统一走锁
+        synchronized(styledCacheLock) {
+            styledCache[key]?.let { return SpannableStringBuilder(it) }
+        }
+        val mdStart = SystemClock.elapsedRealtime()
         val text = SpannableStringBuilder(source)
         Regex("(?m)^(#{1,6})[ \\t]+(.+)$").findAll(text).toList().asReversed().forEach { match ->
             val markerStart = match.range.first
@@ -3617,8 +3659,39 @@ class MainActivity : Activity() {
             text.setSpan(TypefaceSpan("monospace"), start, styledEnd, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
             text.setSpan(BackgroundColorSpan(COLOR_INLINE_CODE), start, styledEnd, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
-        styledCache[key] = text
+        mdPerfMillis.addAndGet(SystemClock.elapsedRealtime() - mdStart)
+        mdPerfMisses.incrementAndGet()
+        synchronized(styledCacheLock) {
+            styledCache[key] = text
+        }
         return text
+    }
+
+    /** （B）worker 线程预热 markdown 缓存，让主线程渲染命中缓存、跳过正则（加载/流式热路径）。 */
+    private fun warmStyledCache(messages: List<ChatMessage>) {
+        for (message in messages) {
+            if (message.text.isNotEmpty() &&
+                (message.role == ChatMessage.Role.USER ||
+                    message.role == ChatMessage.Role.ASSISTANT ||
+                    message.role == ChatMessage.Role.NOTICE)
+            ) {
+                primeStyledCache(message.text)
+            }
+        }
+    }
+
+    /** 只补未命中：命中直接跳过（不做克隆），避免流式快照每次全量克隆 80 条的浪费。 */
+    private fun primeStyledCache(source: String) {
+        val key = (if (darkTheme) "d:" else "l:") + source
+        synchronized(styledCacheLock) { if (styledCache.containsKey(key)) return }
+        styledMessage(source)
+    }
+
+    /** （A）打点：打印分类耗时与 markdown 统计（mdMisses/mdMs 传 -1 表示不打印）。 */
+    private fun perfLog(section: String, ms: Long, mdMisses: Long = -1, mdMs: Long = -1) {
+        if (!PERF_LOG) return
+        val md = if (mdMisses >= 0) " mdMiss=${mdMisses} mdMs=${mdMs}" else ""
+        Log.i("DSHPerf", "perf.$section ${ms}ms$md")
     }
 
     private fun maybeHandleCredentialFailure(messages: List<ChatMessage>) {
