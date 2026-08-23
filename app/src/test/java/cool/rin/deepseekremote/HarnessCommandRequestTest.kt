@@ -12,6 +12,7 @@ class HarnessCommandRequestTest {
 
         assertEquals("session-1", args.getString("agentId"))
         assertEquals("/permission danger-full-access", args.getString("line"))
+        assertEquals(org.json.JSONArray(), args.getJSONArray("images"))
         assertFalse(payload.has("content"))
         assertFalse(payload.has("mode"))
     }

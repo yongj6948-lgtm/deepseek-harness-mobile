@@ -16,6 +16,8 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -35,8 +37,11 @@ import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
+import android.util.Base64
 import android.util.Log
 import android.util.TypedValue
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -65,6 +70,7 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -116,6 +122,23 @@ class MainActivity : Activity() {
     private lateinit var drawerToolbarHost: FrameLayout
     private lateinit var sessionList: LinearLayout
     private var commandPopup: PopupWindow? = null
+
+    private var attachButton: ImageButton? = null
+    private lateinit var attachmentHost: LinearLayout
+    private val draftImages = mutableListOf<DraftImage>()
+    private var attachEnabled = true
+
+    private class DraftImage(
+        val name: String,
+        val mediaType: String,
+        val data: String,
+        val thumb: Bitmap,
+    )
+
+    private val REQ_PICK_IMAGES = 4110
+    private val MAX_PICK_IMAGES = 9
+    private val MAX_IMAGE_BYTES = 5 * 1024 * 1024
+    private val MAX_IMAGE_DIM = 1600
 
     private var sessions = emptyList<HarnessApi.Session>()
     private var drawerWorkspaces = emptyList<HarnessApi.Workspace>()
@@ -797,6 +820,12 @@ class MainActivity : Activity() {
             })
         }
         card.addView(composer, LinearLayout.LayoutParams(MATCH, WRAP))
+        attachmentHost = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
+        card.addView(attachmentHost, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(6) })
         val toolbar = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -817,6 +846,17 @@ class MainActivity : Activity() {
                 }
             }
         }, LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginEnd = dp(4) })
+        attachButton = ImageButton(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_image_outline)
+            imageTintList = ColorStateList.valueOf(COLOR_CONTROL_TEXT)
+            setPadding(dp(11), dp(11), dp(11), dp(11))
+            background = rounded(COLOR_MENU_SELECTED, 18f)
+            contentDescription = tr("添加图片附件", "Attach images")
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { pickImages() }
+        }
+        toolbar.addView(attachButton, LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginEnd = dp(4) })
         val leading = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -869,6 +909,7 @@ class MainActivity : Activity() {
         }
         addView(statsView, LinearLayout.LayoutParams(MATCH, dp(22)))
         updateSendState()
+        renderAttachments()
     }
 
     private fun toolbarChip(label: String, icon: Int?, action: () -> Unit) = TextView(this).apply {
@@ -3909,8 +3950,17 @@ class MainActivity : Activity() {
             return
         }
         val text = composer.text.toString().trim()
-        if (text.isEmpty()) return
-        val content = JSONArray().put(JSONObject().put("type", "text").put("text", text))
+        val images = draftImages.toList()
+        if (text.isEmpty() && images.isEmpty()) return
+        val content = JSONArray()
+        if (text.isNotEmpty()) content.put(JSONObject().put("type", "text").put("text", text))
+        for (image in images) {
+            content.put(JSONObject()
+                .put("type", "image")
+                .put("mediaType", image.mediaType)
+                .put("data", image.data)
+                .apply { if (image.name.isNotBlank()) put("name", image.name) })
+        }
         composer.setText("")
         knownAssistantKeysBeforePrompt = lastMessages
             .filter { it.role == ChatMessage.Role.ASSISTANT }
@@ -3931,6 +3981,7 @@ class MainActivity : Activity() {
                         serverUrl?.let { TaskMonitorService.watch(this, it, listOf(startedSession), runningStartedAt!!) }
                     }
                     updateStatus(tr("运行中", "Running"), STATUS_CONNECTED)
+                    clearDrafts(images)
                     refresh(showSpinner = false)
                 }
             } catch (_: HarnessApi.AuthenticationRequired) {
@@ -3952,18 +4003,248 @@ class MainActivity : Activity() {
 
     private fun setComposerEnabled(enabled: Boolean) {
         composer.isEnabled = enabled
+        attachEnabled = enabled
         updateSendState()
+        updateAttachState()
     }
 
     private fun updateSendState() {
         if (!::sendButton.isInitialized || !::composer.isInitialized) return
         val running = currentSession?.running == true
-        val hasDraft = composer.text?.isNotBlank() == true
+        val hasDraft = composer.text?.isNotBlank() == true || draftImages.isNotEmpty()
         val enabled = running || (composer.isEnabled && hasDraft)
         sendButton.isEnabled = enabled
         sendButton.alpha = 1f
         sendButton.imageTintList = ColorStateList.valueOf(if (enabled) Color.WHITE else COLOR_SEND_DISABLED_ICON)
         sendButton.background = rounded(if (enabled) COLOR_BLUE else COLOR_SEND_DISABLED, 22f)
+    }
+
+    private fun pickImages() {
+        if (!attachEnabled) return
+        val intent = if (Build.VERSION.SDK_INT >= 33) {
+            Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+                putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, MAX_PICK_IMAGES)
+            }
+        } else {
+            Intent(Intent.ACTION_GET_CONTENT).apply {
+                type = "image/*"
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            }
+        }
+        try {
+            startActivityForResult(intent, REQ_PICK_IMAGES)
+        } catch (_: ActivityNotFoundException) {
+            if (Build.VERSION.SDK_INT >= 33) {
+                try {
+                    startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply {
+                        type = "image/*"
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    }, REQ_PICK_IMAGES)
+                    return
+                } catch (_: ActivityNotFoundException) {
+                }
+            }
+            Toast.makeText(this, tr("系统无法打开图片选择器", "No image picker is available"), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_PICK_IMAGES || resultCode != Activity.RESULT_OK) return
+        val uris = mutableListOf<Uri>()
+        data?.data?.let(uris::add)
+        data?.clipData?.let { clip ->
+            for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let(uris::add)
+        }
+        if (uris.isEmpty()) return
+        val room = (MAX_PICK_IMAGES - draftImages.size).coerceAtLeast(0)
+        if (uris.size > room) {
+            Toast.makeText(this, tr("最多选择 $MAX_PICK_IMAGES 张图片", "Select at most $MAX_PICK_IMAGES images"), Toast.LENGTH_LONG).show()
+        }
+        for (uri in uris.take(room)) processImageUri(uri)
+    }
+
+    private fun processImageUri(uri: Uri) {
+        worker.execute {
+            try {
+                val draft = buildDraftImage(uri) ?: return@execute
+                mainHandler.post {
+                    if (!attachEnabled) {
+                        draft.thumb.recycle()
+                        return@post
+                    }
+                    draftImages.add(draft)
+                    renderAttachments()
+                }
+            } catch (error: Exception) {
+                val message = error.message ?: tr("图片读取失败", "Could not read the image")
+                mainHandler.post { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
+    private fun buildDraftImage(uri: Uri): DraftImage? {
+        val mime = contentResolver.getType(uri)?.lowercase()
+            ?: throw IOException(tr("无法识别该图片格式", "Unrecognized image type"))
+        val name = queryDisplayName(uri) ?: "image"
+        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            ?: throw IOException(tr("无法读取图片内容", "Could not read the image"))
+        if (bytes.isEmpty()) throw IOException(tr("图片内容为空", "The image is empty"))
+        return prepareDraft(bytes, mime, name)
+    }
+
+    private fun prepareDraft(raw: ByteArray, mime: String, name: String): DraftImage {
+        if (mime == "image/gif" && raw.size <= MAX_IMAGE_BYTES) {
+            val thumb = decodeThumb(raw)
+                ?: throw IOException(tr("无法解码该 GIF", "Could not decode this GIF"))
+            return DraftImage(name, "image/gif", Base64.encodeToString(raw, Base64.NO_WRAP), thumb)
+        }
+        // 统一解码并按需重编码：webp/jpeg 转 jpeg，png 带透明保留 png，超大 gif 取首帧转 jpeg
+        var bitmap = decodeScaled(raw, MAX_IMAGE_DIM)
+            ?: throw IOException(tr("无法解码该图片", "Could not decode this image"))
+        val keepPng = mime == "image/png" && bitmap.hasAlpha()
+        val announceType = if (keepPng) "image/png" else "image/jpeg"
+        val thumb = centerSquareThumb(bitmap, 112)
+        val output = ByteArrayOutputStream()
+        val ok = bitmap.compress(if (keepPng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG, 90, output)
+        bitmap.recycle()
+        if (!ok) {
+            thumb.recycle()
+            throw IOException(tr("图片编码失败", "Could not encode the image"))
+        }
+        var encoded = output.toByteArray()
+        if (!keepPng && encoded.size > MAX_IMAGE_BYTES) {
+            val redecoded = BitmapFactory.decodeByteArray(encoded, 0, encoded.size)
+            val compressed = ByteArrayOutputStream()
+            if (redecoded != null && redecoded.compress(Bitmap.CompressFormat.JPEG, 55, compressed)) {
+                val smaller = compressed.toByteArray()
+                if (smaller.size < encoded.size) encoded = smaller
+            }
+            redecoded?.recycle()
+        }
+        return DraftImage(name, announceType, Base64.encodeToString(encoded, Base64.NO_WRAP), thumb)
+    }
+
+    private fun decodeScaled(bytes: ByteArray, maxDim: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        var sample = 1
+        var w = bounds.outWidth
+        var h = bounds.outHeight
+        while (w > 0 && h > 0 && (w / (sample * 2) >= maxDim || h / (sample * 2) >= maxDim)) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+        if (maxOf(bitmap.width, bitmap.height) > maxDim) {
+            val scale = maxDim.toFloat() / maxOf(bitmap.width, bitmap.height).toFloat()
+            val scaled = Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).toInt().coerceAtLeast(1),
+                (bitmap.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
+            if (scaled !== bitmap) bitmap.recycle()
+            bitmap = scaled
+        }
+        return bitmap
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        var name: String? = null
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) name = cursor.getString(index)
+            }
+        }
+        return name
+    }
+
+    private fun decodeThumb(bytes: ByteArray): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= 112 || bounds.outHeight / (sample * 2) >= 112) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+        val thumb = centerSquareThumb(bitmap, 112)
+        bitmap.recycle()
+        return thumb
+    }
+
+    private fun centerSquareThumb(source: Bitmap, size: Int): Bitmap {
+        val w = source.width
+        val h = source.height
+        val side = minOf(w, h)
+        val square = Bitmap.createBitmap(source, (w - side) / 2, (h - side) / 2, side, side)
+        val scaled = Bitmap.createScaledBitmap(square, size, size, true)
+        if (scaled !== square) square.recycle()
+        return scaled
+    }
+
+    private fun renderAttachments() {
+        if (!::attachmentHost.isInitialized) return
+        attachmentHost.removeAllViews()
+        if (draftImages.isEmpty()) {
+            attachmentHost.visibility = View.GONE
+        } else {
+            attachmentHost.visibility = View.VISIBLE
+            for ((index, draft) in draftImages.withIndex()) {
+                attachmentHost.addView(buildAttachmentChip(draft, index))
+            }
+        }
+        updateSendState()
+        updateAttachState()
+    }
+
+    private fun buildAttachmentChip(draft: DraftImage, index: Int): View {
+        val chip = FrameLayout(this@MainActivity).apply {
+            background = rounded(COLOR_CODE_SURFACE, 14f)
+        }
+        val preview = ImageView(this@MainActivity).apply {
+            setImageBitmap(draft.thumb)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            contentDescription = draft.name
+        }
+        chip.addView(preview, FrameLayout.LayoutParams(dp(56), dp(56)))
+        val remove = ImageButton(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_close_outline)
+            imageTintList = ColorStateList.valueOf(Color.WHITE)
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            background = rounded(Color.argb(160, 0, 0, 0), 10f)
+            contentDescription = tr("移除图片 ${draft.name}", "Remove ${draft.name}")
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { removeDraftImage(index) }
+        }
+        chip.addView(remove, FrameLayout.LayoutParams(dp(20), dp(20)).apply {
+            gravity = Gravity.TOP or Gravity.END
+        })
+        val host = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(chip, LinearLayout.LayoutParams(dp(56), dp(56)))
+        }
+        host.layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { marginEnd = dp(8) }
+        return host
+    }
+
+    private fun removeDraftImage(index: Int) {
+        draftImages.getOrNull(index)?.thumb?.recycle()
+        draftImages.removeAt(index)
+        renderAttachments()
+    }
+
+    private fun clearDrafts(sent: List<DraftImage>) {
+        val sentSet = sent.toHashSet()
+        draftImages.retainAll { !sentSet.contains(it) }
+        sent.forEach { it.thumb.recycle() }
+        renderAttachments()
+    }
+
+    private fun updateAttachState() {
+        val button = attachButton ?: return
+        val enabled = attachEnabled && currentSession?.running != true
+        button.isEnabled = enabled
+        button.alpha = if (enabled) 1f else 0.4f
     }
 
     private fun showSessions() {
@@ -4761,8 +5042,14 @@ class MainActivity : Activity() {
         progress.visibility = View.VISIBLE
         worker.execute {
             try {
-                api.command(sessionId, command)
-                mainHandler.post { progress.visibility = View.GONE; refresh(false) }
+                val outcome = api.command(sessionId, command)
+                mainHandler.post {
+                    progress.visibility = View.GONE
+                    if (outcome?.kind == "error") {
+                        Toast.makeText(this, outcome.text ?: tr("命令执行失败", "Command failed"), Toast.LENGTH_LONG).show()
+                    }
+                    refresh(false)
+                }
             } catch (error: Exception) {
                 mainHandler.post { progress.visibility = View.GONE; Toast.makeText(this, error.message, Toast.LENGTH_LONG).show() }
             }

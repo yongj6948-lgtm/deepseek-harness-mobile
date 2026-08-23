@@ -18,6 +18,7 @@ Status checked against the local Harness source and the Pixel build on 2026-08-1
 - Model-catalog partial failures from `session.models.failures`, shown in the model picker with their provider error and a retry action.
 - Native approval request card and allow/deny response.
 - Final-assistant action strip matching Web: clipboard copy with confirmation, positive/negative message feedback with compare-and-set reconciliation, branch-at-message, and turn runtime/TTFT/token-rate metrics. Narrow screens keep the official single-line order and allow horizontal scrolling.
+- Image attachments: native gallery/photo picker with per-image compression, canonical-base64 upload through the official `session.prompt` image content part, a removable preview strip, and attachments kept intact for retry when a send fails. Multimodal-capable models receive the image directly; text-only models get it only when the deployment declares `imageFallback: path`.
 
 ## Web source audit: easy-to-miss states
 
@@ -30,7 +31,7 @@ Status checked against the local Harness source and the Pixel build on 2026-08-1
 - Session archive/unarchive, manual reorder, older-history pagination, and queued-item edit/remove.
 - Workspace create/rename/delete/reorder and native directory browsing/adoption.
 - Agent preset read/copy/open/delete authoring screens.
-- Image/text attachments and upload failure/retry.
+- Rendering received images in the message stream (backed by the `session.attachment` RPC) and non-image file upload — the Harness prompt wire only accepts `text` and `image` content parts, so generic file attachments need an upstream content type first.
 - Question composer, plan-review card, goal editing, subagent tree, background jobs, schedules, workflow runs, terminal, deliverables/downloads, skills, commands, and settings schema editor.
 
 The Settings footer keeps the authenticated Harness Web surface reachable for these advanced domains during the native migration. That fallback preserves access, but it is not counted as native parity.

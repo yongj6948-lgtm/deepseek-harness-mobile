@@ -139,6 +139,11 @@ internal class HarnessApi(
         val reason: String?,
     )
 
+    data class CommandOutcome(
+        val kind: String?,
+        val text: String?,
+    )
+
     data class SessionExport(val url: String, val cookie: String?)
 
     data class MessageFeedback(
@@ -470,8 +475,22 @@ internal class HarnessApi(
         })
     }
 
-    fun command(sessionId: String, command: String) {
-        call("commands/execute", commandExecutionPayload(sessionId, command))
+    /**
+     * Execute one slash-command line against a session's agent.
+     *
+     * The wire descriptor requires an `images` field in args (empty for a plain
+     * invocation); omitting it makes the typert gateway reject every command
+     * with `missing "images"`. The value carries the command outcome
+     * (`{commandId, result:{kind, text}}`) or is absent for an unmatched line.
+     */
+    fun command(sessionId: String, command: String): CommandOutcome? {
+        val value = call("commands/execute", commandExecutionPayload(sessionId, command))
+        return value.optJSONObject("result")?.let { result ->
+            CommandOutcome(
+                kind = result.optNullableString("kind"),
+                text = result.optNullableString("text"),
+            )
+        }
     }
 
     fun prepareSessionExport(sessionId: String): SessionExport {
@@ -678,7 +697,8 @@ internal fun commandExecutionPayload(sessionId: String, command: String): JSONOb
     "args",
     JSONObject()
         .put("agentId", sessionId)
-        .put("line", command),
+        .put("line", command)
+        .put("images", JSONArray()),
 )
 
 internal fun JSONArray.objects(): List<JSONObject> = (0 until length()).map(::getJSONObject)
